@@ -1,0 +1,4 @@
+langgraph>=0.4.1
+langchain-core>=0.3.0
+pydantic>=2.7.0
+rich>=13.7.0
