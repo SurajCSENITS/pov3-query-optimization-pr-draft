@@ -57,6 +57,8 @@ async def startup_event() -> None:
     logger.info("POV3 server starting...")
     logger.info("Snowflake enabled: %s", settings.snowflake_enabled)
     logger.info("Snowflake configured: %s", settings.snowflake_configured)
+    logger.info("Bedrock configured: %s", settings.bedrock_configured)
+    logger.info("RAG configured: %s", settings.rag_configured)
 
     if settings.snowflake_configured:
         logger.info(
@@ -68,6 +70,17 @@ async def startup_event() -> None:
         )
     else:
         logger.info("Running in MOCK MODE — Snowflake not configured or disabled.")
+
+    if settings.bedrock_configured:
+        logger.info(
+            "Bedrock: model=%s screener=%s region=%s",
+            settings.bedrock_model_id,
+            settings.bedrock_screener_model_id,
+            settings.aws_region,
+        )
+        logger.info("RAG KB: %s (bucket=%s)", settings.bedrock_kb_id, settings.s3_bucket_name)
+    else:
+        logger.info("Bedrock not configured — LLM optimization disabled.")
 
 
 # ── Direct execution ───────────────────────────────────────────

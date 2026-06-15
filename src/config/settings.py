@@ -49,6 +49,28 @@ class Settings(BaseSettings):
 
     # ── Feature Flags ───────────────────────────────────────────
     snowflake_enabled: bool = False
+    bedrock_enabled: bool = False
+
+    # ── AWS Credentials ─────────────────────────────────────────
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_region: str = "us-east-1"
+
+    # ── Bedrock Model Configuration ─────────────────────────────
+    bedrock_model_id: str = "amazon.nova-pro-v1:0"
+    bedrock_screener_model_id: str = "amazon.nova-lite-v1:0"
+    bedrock_embed_model_id: str = "amazon.titan-embed-text-v2:0"
+    bedrock_max_tokens: int = 4096
+
+    # ── RAG / Knowledge Base ────────────────────────────────────
+    bedrock_kb_id: str = ""
+    s3_bucket_name: str = "pov3-optimization-reports"
+    s3_reports_prefix: str = "reports/"
+
+    # ── Observability ───────────────────────────────────────────
+    log_level: str = "INFO"
+
+    # ── Derived properties ──────────────────────────────────────
 
     @property
     def snowflake_configured(self) -> bool:
@@ -59,6 +81,21 @@ class Settings(BaseSettings):
             and self.snowflake_password
             and self.snowflake_enabled
         )
+
+    @property
+    def bedrock_configured(self) -> bool:
+        """Check if minimum AWS Bedrock credentials are provided."""
+        return bool(
+            self.aws_access_key_id
+            and self.aws_secret_access_key
+            and self.bedrock_model_id
+            and self.bedrock_enabled
+        )
+
+    @property
+    def rag_configured(self) -> bool:
+        """Check if RAG Knowledge Base is configured."""
+        return bool(self.bedrock_configured and self.bedrock_kb_id)
 
 
 @lru_cache()
