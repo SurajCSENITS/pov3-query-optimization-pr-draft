@@ -15,6 +15,7 @@ from rich.panel import Panel
 from src.agents.base import BaseAgent, console
 from src.models.messages import AgentRole
 from src.models.state import QueryOptimizationState
+from src.reporters.html_report import get_html_report_generator
 
 
 class PRAgent(BaseAgent):
@@ -160,9 +161,27 @@ class PRAgent(BaseAgent):
             )
         )
 
+        # ── Sprint 2: Generate HTML Report ───────────────────────────────────
+        report_path = ""
+        try:
+            generator = get_html_report_generator()
+            # Inject the pr_output into state so the generator can read it
+            state_with_pr = dict(state)
+            state_with_pr["pr"] = pr_output
+            path = generator.generate(state_with_pr)
+            report_path = str(path)
+            console.print(
+                f"  📄 [bold green]HTML Report:[/] [cyan]{report_path}[/]"
+            )
+        except Exception as exc:
+            console.print(f"  ⚠️  [yellow]HTML report generation failed (non-fatal): {exc}[/]")
+
+        pr_output["report_path"] = report_path
+
         return {
             "state_key": "pr",
             "output": pr_output,
             "next_agent": "HumanReviewer",
             "task_desc": "Draft PR created — awaiting human review",
+            "extra_state": {"report_path": report_path},
         }

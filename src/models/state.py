@@ -35,6 +35,15 @@ class QueryOptimizationState(TypedDict):
     report: dict[str, Any]
     pr: dict[str, Any]
 
+    # ── Sprint 2 additions ──────────────────────────────────────
+    # Raw RAG retrieval results (list of {content, score, source} dicts).
+    # Written by OptimizationAgent; consumed by HTMLReportGenerator (Section 5).
+    rag_results: list[dict]
+
+    # Structured validation evidence bundle.
+    # Written by ValidationAgent; consumed by HTMLReportGenerator (Section 6).
+    validation_evidence: dict[str, Any]
+
     # ── A2A message ledger ──────────────────────────────────────
     # Annotated with a reducer so each node can *append* messages
     # without overwriting previous entries.

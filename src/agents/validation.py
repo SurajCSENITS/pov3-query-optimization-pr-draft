@@ -26,16 +26,57 @@ The decision is stored in state and drives PR body wording.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from src.agents.base import BaseAgent, console
 from src.config.settings import get_settings
 from src.engines.explain_plan_diff import ExplainPlanDiffEngine
+from src.engines.performance_comparison import PerformanceComparisonEngine
 from src.engines.sql_safety import SQLSafetyEngine
 from src.models.messages import AgentRole
 from src.models.state import QueryOptimizationState
+from src.models.validation_evidence import CheckResult, ValidationEvidence
 
 logger = logging.getLogger(__name__)
+
+# Snowflake warehouse sizes → credits consumed per hour.
+# Source: Snowflake documentation (standard credit table).
+_WAREHOUSE_CREDITS_PER_HOUR: dict[str, float] = {
+    "X-SMALL":  1.0,
+    "SMALL":     2.0,
+    "MEDIUM":    4.0,
+    "LARGE":     8.0,
+    "X-LARGE":  16.0,
+    "2X-LARGE": 32.0,
+    "3X-LARGE": 64.0,
+    "4X-LARGE": 128.0,
+}
+
+
+# ── Module-level helper ────────────────────────────────────────────────────────
+
+def _diff_to_summary(diff: Any):
+    """
+    Convert an ExplainPlanDiff object (or dict) to an ExplainDiffSummary.
+
+    Used when the diff object doesn't expose a .to_summary() method.
+    Falls back to an empty ExplainDiffSummary if extraction fails.
+    """
+    from src.models.optimization_report import ExplainDiffSummary
+    try:
+        diff_dict = diff.to_dict() if hasattr(diff, "to_dict") else (diff if isinstance(diff, dict) else {})
+        return ExplainDiffSummary(
+            removed_operations=diff_dict.get("removed_operations", []),
+            added_operations=diff_dict.get("added_operations", []),
+            insights=diff_dict.get("insights", []),
+            rows_reduced_pct=diff_dict.get("metrics", {}).get("bytes_scanned_reduction_pct", 0.0),
+            bytes_reduced_pct=diff_dict.get("metrics", {}).get("bytes_scanned_reduction_pct", 0.0),
+            overall_improvement_score=diff_dict.get("overall_improvement_score", 0.0),
+        )
+    except Exception:
+        from src.models.optimization_report import ExplainDiffSummary
+        return ExplainDiffSummary()
 
 
 class ValidationAgent(BaseAgent):
@@ -47,6 +88,7 @@ class ValidationAgent(BaseAgent):
         self._settings = get_settings()
         self._safety_engine = SQLSafetyEngine()
         self._diff_engine = ExplainPlanDiffEngine()
+        self._perf_engine = PerformanceComparisonEngine()
 
     def process(self, state: QueryOptimizationState) -> dict[str, Any]:
         optimization = state["optimization"]
@@ -76,8 +118,29 @@ class ValidationAgent(BaseAgent):
 
         # ── Stage 2: Explain Plan Diff ───────────────────────────────────────
         console.print("  📊 Running EXPLAIN plan diff...")
-        original_explain = analysis.get("original_explain", "")
-        optimized_explain = analysis.get("optimized_explain", "")
+        # Use query_plan from AnalysisAgent, falling back to original_explain if needed
+        original_explain = analysis.get("query_plan", "") or analysis.get("original_explain", "")
+        
+        # Fetch optimized explain plan from Snowflake if configured
+        optimized_explain = ""
+        if self._settings.snowflake_configured:
+            try:
+                from src.connectors.snowflake_manager import get_connection_manager
+                manager = get_connection_manager()
+                explain_results = manager.explain_query(optimized_sql)
+                if explain_results:
+                    plan_lines = []
+                    for row in explain_results:
+                        for col_val in row.values():
+                            if col_val:
+                                plan_lines.append(str(col_val))
+                    optimized_explain = "\n".join(plan_lines)
+            except Exception as e:
+                logger.warning("Failed to fetch EXPLAIN for optimized query: %s", e)
+        else:
+            # Fallback if there's any mock optimized_explain injected in analysis
+            optimized_explain = analysis.get("optimized_explain", "")
+
         diff = self._diff_engine.compare(original_explain, optimized_explain)
 
         console.print(
@@ -114,8 +177,88 @@ class ValidationAgent(BaseAgent):
             llm_confidence=llm_confidence,
         )
 
-        # ── Performance metrics (combining real diff + input data) ───────────
-        metrics = self._build_metrics(input_data, optimization, diff)
+        # ── Stage 3½: Live Snowflake execution (optional) ───────────────────
+        real_optimized_time: float | None = None
+        real_optimized_credits: float | None = None
+
+        if self._settings.snowflake_configured:
+            console.print("  ⏱️  Executing optimized query on Snowflake for real telemetry...")
+            real_optimized_time, real_optimized_credits = (
+                self._execute_optimized_query(optimized_sql)
+            )
+            if real_optimized_time is not None:
+                console.print(
+                    f"  ✅ Live execution: "
+                    f"{real_optimized_time:.2f}s, "
+                    f"{real_optimized_credits:.4f} credits"
+                )
+            else:
+                console.print(
+                    "  ⚠️  [yellow]Live execution failed — falling back to heuristic metrics[/]"
+                )
+        else:
+            console.print(
+                "  ⚠️  [yellow]Snowflake not configured — using simulated performance metrics[/]"
+            )
+
+        # ── Performance metrics via PerformanceComparisonEngine ───────────────
+        perf_diff = self._perf_engine.from_pipeline_data(
+            input_data=input_data,
+            optimization=optimization,
+            explain_diff=diff,
+            real_optimized_time=real_optimized_time,
+            real_optimized_credits=real_optimized_credits,
+        )
+        metrics = self._perf_engine.to_metrics_dict(perf_diff)
+
+        # ── Build ValidationEvidence bundle (Sprint 2) ──────────────────────
+        stage1_results: list[CheckResult] = []
+        for check in safety_report.passed_checks:
+            stage1_results.append(CheckResult(
+                check_name=check,
+                passed=True,
+                severity="INFO",
+                detail="Check passed",
+                evidence="passed",
+            ))
+        for check in safety_report.critical_failures:
+            stage1_results.append(CheckResult(
+                check_name=check,
+                passed=False,
+                severity="CRITICAL",
+                detail="Critical safety failure — optimization rejected",
+                evidence="failed",
+            ))
+        for check in safety_report.warnings:
+            stage1_results.append(CheckResult(
+                check_name=check,
+                passed=True,
+                severity="WARNING",
+                detail="Check passed with warning",
+                evidence="warning",
+            ))
+
+        stage3_check = CheckResult(
+            check_name="LLM Semantic Equivalence",
+            passed=semantic_equivalent,
+            severity="WARNING" if not semantic_equivalent else "INFO",
+            detail=(
+                f"LLM confirmed {'equivalent' if semantic_equivalent else 'NOT equivalent'} "
+                f"(confidence={llm_confidence:.0%})"
+            ) if llm_used else "LLM check not run (Bedrock not configured)",
+            evidence=(
+                f"confidence={llm_confidence:.2f}; concerns={'; '.join(llm_concerns)}"
+                if llm_concerns else f"confidence={llm_confidence:.2f}"
+            ),
+        )
+
+        evidence = ValidationEvidence(
+            stage1_safety=stage1_results,
+            stage2_diff=diff.to_summary() if hasattr(diff, "to_summary") else _diff_to_summary(diff),
+            stage3_semantic=stage3_check,
+            overall_decision=decision,
+            confidence_score=llm_confidence if llm_used else 0.85,
+        )
 
         # ── Assemble output ──────────────────────────────────────────────────
         validation_output = {
@@ -138,11 +281,15 @@ class ValidationAgent(BaseAgent):
 
             # Performance
             "metrics": metrics,
+            "perf_diff": perf_diff.model_dump(),
             "row_count_original": 2_847_391,
             "row_count_optimized": 2_847_391,
 
             # Convenience fields used by ReportAgent
             "confidence_score": llm_confidence if llm_used else 0.85,
+
+            # Sprint 2: structured evidence bundle
+            "validation_evidence": evidence.model_dump(),
         }
 
         # ── Final console summary ─────────────────────────────────────────────
@@ -176,7 +323,96 @@ class ValidationAgent(BaseAgent):
             "task_desc": (
                 f"Generate optimization report — validation {decision}"
             ),
+            # Sprint 2: expose evidence bundle directly on the state patch
+            # so base.run() writes it under the 'validation_evidence' state key
+            "extra_state": {"validation_evidence": evidence.model_dump()},
         }
+
+    # ── Live Snowflake execution ────────────────────────────────────────────
+
+    def _execute_optimized_query(
+        self,
+        optimized_sql: str,
+    ) -> tuple[float | None, float | None]:
+        """
+        Execute the optimized SQL inside a transaction that is always
+        rolled back so no data is modified (DML/DDL safety).
+
+        The query is wrapped as::
+
+            BEGIN;
+            <optimized_sql>;
+            ROLLBACK;
+
+        Execution time is captured with `time.perf_counter()`.  Credit
+        consumption is derived from the configured warehouse size using
+        the standard Snowflake credits-per-hour table.
+
+        Returns:
+            (execution_time_sec, credits_used) on success, or
+            (None, None) on any connection / execution failure — the
+            caller falls back to the heuristic metrics in that case.
+        """
+        from src.connectors.snowflake_manager import get_connection_manager
+
+        try:
+            manager = get_connection_manager()
+
+            # Determine actual warehouse size from Snowflake
+            warehouse_name = self._settings.snowflake_warehouse
+            warehouse_size = "X-SMALL"
+            try:
+                wh_results = manager.execute_query(f"SHOW WAREHOUSES LIKE '{warehouse_name}'")
+                if wh_results:
+                    row = wh_results[0]
+                    warehouse_size = str(row.get("SIZE", row.get("size", "X-SMALL"))).upper()
+            except Exception as e:
+                logger.warning("Failed to fetch warehouse size, defaulting to X-SMALL: %s", e)
+
+            credits_per_hour = _WAREHOUSE_CREDITS_PER_HOUR.get(warehouse_size, 1.0)
+            if warehouse_size not in _WAREHOUSE_CREDITS_PER_HOUR:
+                logger.warning(
+                    "Unknown warehouse size '%s'; defaulting to X-SMALL (1 credit/hour).",
+                    warehouse_size,
+                )
+
+            # Open an explicit transaction — the ROLLBACK guarantees no
+            # persistent writes even if the query performs DML.
+            manager.execute_query("ALTER SESSION SET USE_CACHED_RESULT = FALSE")
+            manager.execute_query("BEGIN")
+
+            start = time.perf_counter()
+            try:
+                manager.execute_query(optimized_sql, fetch_results=False)
+            finally:
+                # Always roll back — even if the query raised an exception.
+                elapsed = time.perf_counter() - start
+                manager.execute_query("ROLLBACK")
+                try:
+                    manager.execute_query("ALTER SESSION SET USE_CACHED_RESULT = TRUE")
+                except Exception:
+                    pass
+
+            # Credits = (seconds / 3600) × credits_per_hour
+            credits_used = (elapsed / 3600.0) * credits_per_hour
+
+            logger.info(
+                "Optimized query executed in %.3fs (warehouse=%s, rate=%.0f cr/h, "
+                "credits=%.6f).",
+                elapsed,
+                warehouse_size,
+                credits_per_hour,
+                credits_used,
+            )
+            return elapsed, credits_used
+
+        except Exception as exc:
+            logger.warning(
+                "Live Snowflake execution failed (non-fatal); "
+                "falling back to heuristic metrics. Error: %s",
+                exc,
+            )
+            return None, None
 
     # ── LLM semantic check ────────────────────────────────────────────────────
 

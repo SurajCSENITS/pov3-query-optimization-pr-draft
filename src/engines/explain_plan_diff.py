@@ -40,6 +40,8 @@ class DiffMetrics:
 
     partitions_before: int = 0
     partitions_after: int = 0
+    partitions_total_before: int = 0
+    partitions_total_after: int = 0
     partition_pruning_improvement_pct: float = 0.0
 
     estimated_rows_before: int = 0
@@ -48,6 +50,11 @@ class DiffMetrics:
     spill_eliminated: bool = False
     sort_eliminated: bool = False
 
+    # Column scanned metrics
+    columns_scanned_before: int = 0
+    columns_scanned_after: int = 0
+    columns_scanned_reduction_pct: float = 0.0
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "bytes_scanned_before": self.bytes_scanned_before,
@@ -55,11 +62,16 @@ class DiffMetrics:
             "bytes_scanned_reduction_pct": round(self.bytes_scanned_reduction_pct, 1),
             "partitions_before": self.partitions_before,
             "partitions_after": self.partitions_after,
+            "partitions_total_before": self.partitions_total_before,
+            "partitions_total_after": self.partitions_total_after,
             "partition_pruning_improvement_pct": round(self.partition_pruning_improvement_pct, 1),
             "estimated_rows_before": self.estimated_rows_before,
             "estimated_rows_after": self.estimated_rows_after,
             "spill_eliminated": self.spill_eliminated,
             "sort_eliminated": self.sort_eliminated,
+            "columns_scanned_before": self.columns_scanned_before,
+            "columns_scanned_after": self.columns_scanned_after,
+            "columns_scanned_reduction_pct": round(self.columns_scanned_reduction_pct, 1),
         }
 
 
@@ -187,6 +199,22 @@ class ExplainPlanDiffEngine:
             return False
         return bool(re.search(r"spill|remote.storage|disk", plan_text, re.IGNORECASE))
 
+    def _extract_scanned_columns_count(self, plan_text: str) -> int:
+        """Helper to extract and count unique scanned columns from TableScans in the plan."""
+        if not plan_text:
+            return 0
+        cols = set()
+        pattern = re.compile(
+            r"TableScan\s+\S+(?:\s+as\s+\S+)?\s+([A-Za-z0-9_, ]+?)(?:\s*\{|\s*$)",
+            re.IGNORECASE
+        )
+        for match in pattern.finditer(plan_text):
+            for col in match.group(1).split(","):
+                col_name = col.strip()
+                if col_name:
+                    cols.add(col_name.upper())
+        return len(cols)
+
     def _extract_metrics(self, original: str, optimized: str) -> DiffMetrics:
         """
         Extract numeric metrics from EXPLAIN text via regex.
@@ -210,8 +238,15 @@ class ExplainPlanDiffEngine:
         m.partitions_before = extract_int(original, "partitionsAssigned")
         m.partitions_after = extract_int(optimized, "partitionsAssigned")
 
+        m.partitions_total_before = extract_int(original, "partitionsTotal")
+        m.partitions_total_after = extract_int(optimized, "partitionsTotal")
+
         m.estimated_rows_before = extract_int(original, "estimatedRows")
         m.estimated_rows_after = extract_int(optimized, "estimatedRows")
+
+        # ── Column Scanned Metrics ──────────────────────────────
+        m.columns_scanned_before = self._extract_scanned_columns_count(original)
+        m.columns_scanned_after = self._extract_scanned_columns_count(optimized)
 
         # ── Compute reduction percentages ─────────────────────────
         if m.bytes_scanned_before > 0:
@@ -226,6 +261,12 @@ class ExplainPlanDiffEngine:
                 / m.partitions_before * 100
             )
 
+        if m.columns_scanned_before > 0:
+            m.columns_scanned_reduction_pct = (
+                (m.columns_scanned_before - m.columns_scanned_after)
+                / m.columns_scanned_before * 100
+            )
+
         return m
 
     def _compute_score(self, diff: ExplainPlanDiff) -> float:
@@ -233,32 +274,37 @@ class ExplainPlanDiffEngine:
         Compute an overall improvement score 0.0–1.0.
 
         Weights:
-          - bytes reduction:         35%
-          - partition pruning:       25%
-          - removed operations:      20%
-          - spill elimination:       10%
-          - sort elimination:        10%
+          - bytes reduction:         30%
+          - partition pruning:       20%
+          - columns scanned red:     20%
+          - removed operations:      15%
+          - spill elimination:       7.5%
+          - sort elimination:        7.5%
         """
         score = 0.0
 
         # bytes reduction (cap at 100%)
         bytes_pct = min(diff.metrics.bytes_scanned_reduction_pct, 100.0)
-        score += 0.35 * (bytes_pct / 100.0)
+        score += 0.30 * (bytes_pct / 100.0)
 
         # partition pruning
         prune_pct = min(diff.metrics.partition_pruning_improvement_pct, 100.0)
-        score += 0.25 * (prune_pct / 100.0)
+        score += 0.20 * (prune_pct / 100.0)
 
-        # removed operations (each removal = 10%, cap at 20%)
+        # columns scanned reduction
+        cols_pct = min(diff.metrics.columns_scanned_reduction_pct, 100.0)
+        score += 0.20 * (cols_pct / 100.0)
+
+        # removed operations (each removal = 7.5%, cap at 15%)
         removals = min(len(diff.removed_operations), 2)
-        score += 0.20 * (removals / 2.0)
+        score += 0.15 * (removals / 2.0)
 
         # spill elimination
         if diff.metrics.spill_eliminated:
-            score += 0.10
+            score += 0.075
 
         # sort elimination
         if diff.metrics.sort_eliminated:
-            score += 0.10
+            score += 0.075
 
         return round(min(score, 1.0), 3)

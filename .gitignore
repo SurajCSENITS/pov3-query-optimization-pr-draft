@@ -5,3 +5,6 @@ __pycache__/
 .idea/
 .vscode/
 .env
+
+# Sprint 2: auto-generated HTML optimization reports
+reports/

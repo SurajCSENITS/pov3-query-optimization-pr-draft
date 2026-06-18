@@ -64,6 +64,7 @@ class Settings(BaseSettings):
 
     # ── RAG / Knowledge Base ────────────────────────────────────
     bedrock_kb_id: str = ""
+    bedrock_data_source_id: str = ""
     s3_bucket_name: str = "pov3-optimization-reports"
     s3_reports_prefix: str = "reports/"
 

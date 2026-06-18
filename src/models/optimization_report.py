@@ -39,6 +39,41 @@ class PerformanceMetrics(BaseModel):
     spill_eliminated: bool = False
 
 
+class PerformanceSnapshot(BaseModel):
+    """A point-in-time snapshot of query performance numbers."""
+
+    execution_time_sec: float = 0.0
+    credits: float = 0.0
+    bytes_scanned_gb: float = 0.0
+    partition_pruning_pct: float = 0.0
+
+
+class PerformanceDiff(BaseModel):
+    """
+    Computed before/after performance delta for a single optimization run.
+
+    `overall_score` is a weighted composite (0–100):
+      - 50% execution time improvement
+      - 30% credit improvement
+      - 20% bytes-scanned improvement
+
+    `verdict` maps the score to a human-readable label:
+      ≥ 60  → EXCELLENT
+      ≥ 30  → GOOD
+      ≥ 10  → MARGINAL
+      <  10 → NO_IMPROVEMENT
+    """
+
+    before: PerformanceSnapshot = PerformanceSnapshot()
+    after: PerformanceSnapshot = PerformanceSnapshot()
+    execution_time_improvement_pct: float = 0.0
+    credits_improvement_pct: float = 0.0
+    bytes_scanned_improvement_pct: float = 0.0
+    pruning_improvement_pct: float = 0.0
+    overall_score: float = 0.0
+    verdict: str = "NO_IMPROVEMENT"  # EXCELLENT | GOOD | MARGINAL | NO_IMPROVEMENT
+
+
 class ExplainDiffSummary(BaseModel):
     """High-level summary of the Explain Plan diff."""
     removed_operations: list[str] = Field(default_factory=list)

@@ -47,7 +47,12 @@ class ReportAgent(BaseAgent):
         )
 
         # ── Upload to S3 (feeds RAG KB) ──────────────────────────────────────
-        s3_key = self._try_s3_upload(report)
+        decision = validation.get("decision", "APPROVED")
+        s3_key = ""
+        if decision == "APPROVED":
+            s3_key = self._try_s3_upload(report)
+        else:
+            logger.info("Validation decision is %s — skipping S3 upload", decision)
 
         # ── Build the legacy changes_table for backward compatibility ─────────
         changes_table = []

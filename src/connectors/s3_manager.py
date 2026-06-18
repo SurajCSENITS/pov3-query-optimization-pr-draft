@@ -135,6 +135,10 @@ class S3Manager:
             logger.warning("Could not upload summary chunk to S3: %s", e)
             # Non-fatal — full report already uploaded
 
+        # ── Trigger Bedrock Sync ─────────────────────────────────
+        if self._settings.bedrock_kb_id and self._settings.bedrock_data_source_id:
+            self.sync_knowledge_base()
+
         return full_key
 
     def report_exists(self, report_id: str) -> bool:
@@ -147,6 +151,27 @@ class S3Manager:
             return True
         except Exception:
             return False
+
+    def sync_knowledge_base(self) -> None:
+        """Trigger a sync job for the Bedrock Knowledge Base Data Source."""
+        try:
+            import boto3
+
+            bedrock_client = boto3.client(
+                "bedrock-agent",
+                region_name=self._settings.aws_region,
+                aws_access_key_id=self._settings.aws_access_key_id,
+                aws_secret_access_key=self._settings.aws_secret_access_key,
+            )
+            
+            response = bedrock_client.start_ingestion_job(
+                knowledgeBaseId=self._settings.bedrock_kb_id,
+                dataSourceId=self._settings.bedrock_data_source_id,
+            )
+            job_id = response.get("ingestionJob", {}).get("ingestionJobId", "unknown")
+            logger.info("Triggered Bedrock KB sync job: %s", job_id)
+        except Exception as e:
+            logger.error("Failed to trigger Bedrock KB sync: %s", e)
 
 
 def get_s3_manager() -> S3Manager:

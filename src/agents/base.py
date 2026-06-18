@@ -55,10 +55,14 @@ class BaseAgent(abc.ABC):
         self._log_message(outgoing_msg)
 
         # Return the state patch
-        return {
+        state_patch: dict = {
             result["state_key"]: result["output"],
             "messages": [outgoing_msg.model_dump()],
         }
+        # Merge any extra top-level state keys (e.g. validation_evidence)
+        if "extra_state" in result:
+            state_patch.update(result["extra_state"])
+        return state_patch
 
     # ── Subclass contract ───────────────────────────────────────
 

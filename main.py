@@ -40,8 +40,8 @@ SAMPLE_INPUT = {
     "issue_type": "REMOTE_SPILL",
     "query_text": (
         "SELECT * FROM ORDERS o "
-        "JOIN CUSTOMERS c ON o.customer_id = c.customer_id "
-        "WHERE YEAR(o.order_date)=2025"
+        "JOIN CUSTOMER c ON o.o_custkey = c.c_custkey "
+        "WHERE YEAR(o.o_orderdate)=1995"
     ),
 }
 
@@ -115,6 +115,7 @@ def print_final_status(state: dict) -> None:
     """Print the final pipeline status."""
     pr = state.get("pr", {})
     validation = state.get("validation", {})
+    report_path = state.get("report_path", pr.get("report_path", ""))
 
     status_lines = [
         f"Query ID:        {pr.get('query_id', 'N/A')}",
@@ -125,6 +126,9 @@ def print_final_status(state: dict) -> None:
         f"Validation:      {validation.get('semantic_check', 'N/A')}",
         f"Labels:          {', '.join(pr.get('labels', []))}",
     ]
+
+    if report_path:
+        status_lines.append(f"HTML Report:     {report_path}")
 
     console.print()
     console.print(
@@ -159,6 +163,8 @@ def main() -> None:
         "validation": {},
         "report": {},
         "pr": {},
+        "rag_results": [],           # Sprint 2
+        "validation_evidence": {},   # Sprint 2
         "messages": [pov4_message.model_dump()],
     }
 

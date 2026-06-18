@@ -58,6 +58,7 @@ class PipelineResultResponse(BaseModel):
     pr: dict[str, Any] = {}
     validation: dict[str, Any] = {}
     message_trail: list[dict[str, Any]] = []
+    report_path: str = ""  # Sprint 2: path to the generated HTML report
 
 
 class HealthResponse(BaseModel):
@@ -84,6 +85,8 @@ def _run_pipeline(message: AgentMessage) -> dict[str, Any]:
         "validation": {},
         "report": {},
         "pr": {},
+        "rag_results": [],           # Sprint 2
+        "validation_evidence": {},   # Sprint 2
         "messages": [message.model_dump()],
     }
 
@@ -164,6 +167,7 @@ async def ingest_alert(message: AgentMessage) -> PipelineResultResponse:
         pr=final_state.get("pr", {}),
         validation=final_state.get("validation", {}),
         message_trail=final_state.get("messages", []),
+        report_path=final_state.get("report_path", ""),  # Sprint 2
     )
 
 

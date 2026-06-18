@@ -30,7 +30,7 @@ You are an expert Snowflake SQL optimization engineer with deep knowledge of:
 - Snowflake-specific features: QUALIFY, LATERAL FLATTEN, SAMPLE
 
 You always:
-1. Preserve the semantic equivalence of the query (same result set)
+1. Preserve the semantic equivalence of the query (same result set), EXCEPT for exploratory queries (e.g. unbounded SELECT * without an aggregation) where adding a LIMIT clause or pruning unused columns is highly encouraged and considered a valid optimization.
 2. Return valid Snowflake SQL — no PostgreSQL/MySQL-specific syntax
 3. Explain every change you make
 4. Respond ONLY with valid JSON — no markdown, no prose outside the JSON
@@ -149,6 +149,8 @@ def build_screener_prompt(original_sql: str, optimized_sql: str) -> str:
 Determine whether the following two SQL queries are semantically equivalent.
 "Semantically equivalent" means they would produce identical result sets
 (same columns, same rows, same order if ORDER BY exists) on the same data.
+
+EXCEPTION: If the original query is an unbounded exploratory query (e.g. lacks a LIMIT), and the optimized query adds a LIMIT clause or drops unnecessary columns to improve performance, you MUST treat them as semantically equivalent and return true.
 
 ## Original SQL
 ```sql

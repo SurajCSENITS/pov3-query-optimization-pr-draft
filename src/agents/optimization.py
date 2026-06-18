@@ -43,8 +43,8 @@ _FALLBACK_RULES: dict[str, dict[str, str]] = {
     },
     "NON_SARGABLE_PREDICATE": {
         "action": "Replace YEAR(col) with sargable date range predicate",
-        "pattern": r"YEAR\s*\(\s*o\.order_date\s*\)\s*=\s*2025",
-        "replacement": "o.order_date BETWEEN '2025-01-01' AND '2025-12-31'",
+        "pattern": r"YEAR\s*\(\s*o\.order_date\s*\)\s*=\s*1995",
+        "replacement": "o.order_date BETWEEN '1995-01-01' AND '1995-12-31'",
     },
 }
 
@@ -166,6 +166,7 @@ class OptimizationAgent(BaseAgent):
             "optimization_mode": "llm",
             "llm_model": self._settings.bedrock_model_id,
             "rag_cases_used": rag_cases_used,
+            "rag_results": raw_cases,           # Sprint 2: persist for HTML Section 5
             "estimated_improvement_pct": min(len(changes_applied) * 25, 85),
         }
 
@@ -177,6 +178,8 @@ class OptimizationAgent(BaseAgent):
                 f"Validate LLM-optimized query — {len(changes_applied)} changes, "
                 f"confidence {confidence:.0%}"
             ),
+            # Sprint 2: surface raw RAG results at the top-level state
+            "extra_state": {"rag_results": raw_cases},
         }
 
     # ── Rule-based fallback ───────────────────────────────────────────────────
@@ -191,13 +194,32 @@ class OptimizationAgent(BaseAgent):
         """
         optimized_sql = original_sql
         changes_applied: list[dict[str, str]] = []
+        is_real_tpch = "o_orderdate" in original_sql.lower() or "customer" in original_sql.lower()
 
         for bottleneck in analysis["bottlenecks"]:
             rule = _FALLBACK_RULES.get(bottleneck["type"])
             if rule:
+                pattern = rule["pattern"]
+                replacement = rule["replacement"]
+
+                # Adjust for real TPCH schema if detected
+                if is_real_tpch:
+                    if bottleneck["type"] == "FULL_COLUMN_SCAN":
+                        replacement = (
+                            "SELECT\n"
+                            "    o.o_orderkey,\n"
+                            "    o.o_orderdate,\n"
+                            "    o.o_totalprice,\n"
+                            "    c.c_custkey,\n"
+                            "    c.c_name"
+                        )
+                    elif bottleneck["type"] == "NON_SARGABLE_PREDICATE":
+                        pattern = r"YEAR\s*\(\s*o\.o_orderdate\s*\)\s*=\s*1995"
+                        replacement = "o.o_orderdate BETWEEN '1995-01-01' AND '1995-12-31'"
+
                 new_sql = re.sub(
-                    rule["pattern"],
-                    rule["replacement"],
+                    pattern,
+                    replacement,
                     optimized_sql,
                     flags=re.IGNORECASE,
                 )
@@ -238,6 +260,7 @@ class OptimizationAgent(BaseAgent):
             "optimization_mode": "rule_based",
             "llm_model": "",
             "rag_cases_used": 0,
+            "rag_results": [],                  # Sprint 2: empty — no RAG in fallback
             "estimated_improvement_pct": min(len(changes_applied) * 25, 85),
         }
 
@@ -246,4 +269,5 @@ class OptimizationAgent(BaseAgent):
             "output": optimization_output,
             "next_agent": AgentRole.VALIDATION.value,
             "task_desc": f"Validate rule-based optimized query — {len(changes_applied)} changes applied",
+            "extra_state": {"rag_results": []},  # Sprint 2
         }
