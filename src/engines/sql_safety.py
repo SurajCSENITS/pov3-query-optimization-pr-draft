@@ -60,24 +60,27 @@ class SafetyReport:
 
 class SQLSafetyEngine:
     """
-    Deterministic rule-based SQL safety checker.
+    Hybrid SQL safety checker: fast regex pre-filter + LLM evaluation.
 
-    Compares original and optimized SQL strings using pattern matching
-    to flag regressions. Does not execute SQL.
+    Layer 1 (regex): Cheap, instant checks for obvious regressions
+    (DDL/DML injection, CROSS JOIN, WHERE removal, etc.). These
+    remain as deterministic guardrails.
+
+    Layer 2 (LLM): When Bedrock is configured, an LLM evaluator
+    assesses deeper semantic safety criteria that regex cannot catch.
+    This provides richer reasoning about potential regressions.
     """
 
     def run_checks(self, original_sql: str, optimized_sql: str) -> SafetyReport:
         """
         Run all safety checks and return an aggregate SafetyReport.
 
-        Args:
-            original_sql:  The original query (baseline).
-            optimized_sql: The optimized query (candidate).
-
-        Returns:
-            SafetyReport with pass/fail per check and aggregate result.
+        First runs fast regex-based pre-filter checks, then optionally
+        runs an LLM-based semantic evaluation for deeper analysis.
         """
         report = SafetyReport()
+
+        # ── Layer 1: Fast regex pre-filter ─────────────────────────
         results = [
             self._check_no_ddl_dml(optimized_sql),
             self._check_no_cross_join(original_sql, optimized_sql),
@@ -101,7 +104,97 @@ class SQLSafetyEngine:
                 else:
                     report.warnings.append(r.check_name)
 
+        # ── Layer 2: LLM semantic evaluation (when available) ──────
+        llm_result = self._llm_safety_evaluation(original_sql, optimized_sql)
+        if llm_result:
+            report.checks.append(llm_result)
+            if llm_result.passed:
+                report.passed_checks.append(llm_result.check_name)
+            else:
+                if llm_result.severity == "CRITICAL":
+                    report.all_passed = False
+                    report.critical_failures.append(llm_result.check_name)
+                else:
+                    report.warnings.append(llm_result.check_name)
+
         return report
+
+    # ── LLM-based evaluation ─────────────────────────────────────────────────
+
+    def _llm_safety_evaluation(
+        self, original_sql: str, optimized_sql: str
+    ) -> SafetyCheckResult | None:
+        """
+        Use an LLM to evaluate semantic safety criteria that regex cannot detect.
+
+        Returns a SafetyCheckResult or None if Bedrock is not configured.
+        """
+        from src.config.settings import get_settings
+        settings = get_settings()
+
+        if not settings.bedrock_configured:
+            return None
+
+        try:
+            from src.connectors.bedrock_manager import get_screener_llm
+            from langchain_core.prompts import ChatPromptTemplate
+
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", (
+                    "You are a SQL safety reviewer. Evaluate whether the optimized "
+                    "query preserves the semantic correctness of the original query. "
+                    "Respond ONLY with valid JSON."
+                )),
+                ("human", (
+                    "## Original SQL\n```sql\n{original_sql}\n```\n\n"
+                    "## Optimized SQL\n```sql\n{optimized_sql}\n```\n\n"
+                    "Evaluate these criteria:\n"
+                    "1. Are all filtering conditions (WHERE, HAVING) preserved?\n"
+                    "2. Are all aggregation functions (SUM, COUNT, AVG, etc.) preserved?\n"
+                    "3. Are JOIN relationships and cardinality maintained?\n"
+                    "4. Could the optimized query return different results?\n\n"
+                    "Respond with JSON:\n"
+                    '{{"safe": true|false, "confidence": <0.0-1.0>, '
+                    '"reasoning": "<brief explanation>", '
+                    '"concerns": ["<concern 1>", "<concern 2>"]}}'
+                )),
+            ])
+
+            llm = get_screener_llm()
+            response = (prompt | llm).invoke({
+                "original_sql": original_sql.strip(),
+                "optimized_sql": optimized_sql.strip(),
+            })
+
+            # Parse the LLM response
+            import json
+            content = response.content.strip()
+            if content.startswith("```"):
+                lines = content.split("\n")
+                content = "\n".join(lines[1:-1]) if len(lines) > 2 else content
+            result = json.loads(content)
+
+            is_safe = result.get("safe", True)
+            confidence = result.get("confidence", 0.8)
+            reasoning = result.get("reasoning", "")
+            concerns = result.get("concerns", [])
+
+            concern_text = "; ".join(concerns) if concerns else "None"
+
+            return SafetyCheckResult(
+                check_name="LLM_SEMANTIC_SAFETY",
+                passed=is_safe,
+                message=(
+                    f"LLM safety evaluation: {'SAFE' if is_safe else 'UNSAFE'} "
+                    f"(confidence={confidence:.0%}). {reasoning}. "
+                    f"Concerns: {concern_text}"
+                ),
+                severity="WARNING" if not is_safe else "INFO",
+            )
+
+        except Exception as e:
+            logger.warning("LLM safety evaluation failed (non-fatal): %s", e)
+            return None
 
     # ── Individual checks ────────────────────────────────────────────────────
 

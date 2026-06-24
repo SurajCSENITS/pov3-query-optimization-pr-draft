@@ -16,13 +16,11 @@ Usage:
         real_optimized_time=12.4,       # seconds (perf_counter)
         real_optimized_credits=0.0035,  # computed from warehouse size
     )
-    # diff.verdict  →  "EXCELLENT" | "GOOD" | "MARGINAL" | "NO_IMPROVEMENT"
-    # diff.overall_score  →  0.0 - 100.0
 
     When real_optimized_time / real_optimized_credits are provided the engine
-    uses them verbatim instead of the simulated 22%-per-change heuristic.
-    When they are None (offline / mock mode) the heuristic is kept as the
-    fallback so the pipeline degrades gracefully.
+    uses them verbatim. When they are None (offline / mock mode), the engine
+    reports None for metrics that cannot be determined — it does NOT fabricate
+    improvement numbers with hardcoded heuristics.
 """
 
 from __future__ import annotations
@@ -36,10 +34,11 @@ logger = logging.getLogger(__name__)
 
 # ── Verdict thresholds ───────────────────────────────────────────────────────
 _VERDICT_THRESHOLDS = [
-    (60.0, "EXCELLENT"),
-    (30.0, "GOOD"),
-    (10.0, "MARGINAL"),
-    (0.0,  "NO_IMPROVEMENT"),
+    (60.0,  "EXCELLENT"),
+    (30.0,  "GOOD"),
+    (10.0,  "MARGINAL"),
+    (0.0,   "NO_IMPROVEMENT"),
+    # Negative scores indicate regression — query got WORSE
 ]
 
 # ── Composite score weights ──────────────────────────────────────────────────
@@ -52,9 +51,9 @@ class PerformanceComparisonEngine:
     """
     Stateless engine that computes before/after performance deltas.
 
-    The engine accepts raw pipeline dictionaries so it requires no
-    coupling to specific agent classes — it can be called from any
-    context that has access to the pipeline state.
+    Uses ONLY real telemetry data. When real data is unavailable,
+    affected metrics are set to 0.0 with a clear indication that
+    they are not available — no synthetic improvement numbers.
     """
 
     # ── Public factory ────────────────────────────────────────────────────────
@@ -67,34 +66,49 @@ class PerformanceComparisonEngine:
         *,
         real_optimized_time: float | None = None,
         real_optimized_credits: float | None = None,
+        real_optimized_bytes_scanned: int | None = None,
+        real_optimized_partitions_scanned: int | None = None,
+        real_optimized_partitions_total: int | None = None,
+        real_original_bytes_scanned: int | None = None,
+        real_original_partitions_scanned: int | None = None,
+        real_original_partitions_total: int | None = None,
     ) -> PerformanceDiff:
         """
         Build a PerformanceDiff from the raw pipeline stage outputs.
-
-        This replaces the inline `_build_metrics()` logic in ValidationAgent.
-        The output PerformanceDiff contains the same numbers — they are just
-        structured and independently verifiable.
 
         Args:
             input_data:            state["input_data"]   — original POV4 alert payload
             optimization:          state["optimization"] — OptimizationAgent output
             explain_diff:          ExplainPlanDiff object (has .metrics attribute)
             real_optimized_time:   Actual execution duration (seconds) captured by
-                                   ValidationAgent via perf_counter.  When provided,
-                                   replaces the simulated improvement-factor estimate.
+                                   ValidationAgent via perf_counter.
             real_optimized_credits: Actual credit cost derived from warehouse size and
-                                   measured wall-clock time.  When provided, replaces
-                                   the heuristic credit estimate.
+                                   measured wall-clock time.
         """
-        change_count     = optimization.get("change_count", 0)
-        original_time    = float(input_data.get("execution_time_seconds", 120.0))
-        original_credits = float(input_data.get("credits_used", 4.5))
+        original_time = float(input_data.get("execution_time_seconds", 0.0))
+        
+        # ── Fix apples-to-oranges credit comparison ─────────────────────────
+        # POV4 provides CREDITS_USED_CLOUD_SERVICES, which is massively smaller 
+        # than warehouse compute. To ensure a 1:1 comparison against the optimized 
+        # query, we must calculate original credits using the exact same pure 
+        # compute formula.
+        warehouse_size = input_data.get("warehouse_name", "X-SMALL").upper().replace("WH", "").strip("_- ")
+        if not warehouse_size or warehouse_size == "":
+            warehouse_size = "X-SMALL"
+            
+        rate_map = {
+            "X-SMALL": 1.0, "SMALL": 2.0, "MEDIUM": 4.0, "LARGE": 8.0,
+            "X-LARGE": 16.0, "X1": 16.0, "XX-LARGE": 32.0, "X2": 32.0,
+            "X3": 64.0, "X4": 128.0, "X5": 256.0, "X6": 512.0
+        }
+        # Attempt to map standard sizes, fallback to X-SMALL
+        rate = rate_map.get(warehouse_size, 1.0)
+        original_credits = (original_time / 3600.0) * rate
 
-        # ── Time / credits: real telemetry wins; heuristic is the fallback ──────
+        # ── Time / credits: use real telemetry when available ─────────────────
         use_real = real_optimized_time is not None and real_optimized_credits is not None
 
         if use_real:
-            # Live Snowflake execution — use measured values verbatim
             optimized_time    = round(real_optimized_time, 1)
             optimized_credits = round(real_optimized_credits, 4)
             logger.info(
@@ -104,13 +118,12 @@ class PerformanceComparisonEngine:
                 optimized_credits,
             )
         else:
-            # Offline / mock mode — keep the 22%-per-change heuristic
-            improvement_factor = max(0.15, 1.0 - (change_count * 0.22))
-            optimized_time    = round(original_time    * improvement_factor, 1)
-            optimized_credits = round(original_credits * improvement_factor, 2)
-            logger.debug(
-                "PerformanceComparisonEngine: using heuristic improvement_factor=%.2f",
-                improvement_factor,
+            # No real telemetry — report original values as-is with no fake improvement
+            optimized_time    = original_time
+            optimized_credits = original_credits
+            logger.info(
+                "PerformanceComparisonEngine: no real telemetry available — "
+                "reporting original values (no fabricated improvement)"
             )
 
         # ── Bytes scanned: use real EXPLAIN diff if available ─────────────────
@@ -121,63 +134,109 @@ class PerformanceComparisonEngine:
             bytes_pct     = diff_metrics.bytes_scanned_reduction_pct
         except AttributeError:
             # explain_diff may be a plain dict in fallback paths
-            bytes_before = explain_diff.get("metrics", {}).get("bytes_scanned_before", 0) if isinstance(explain_diff, dict) else 0
-            bytes_after  = explain_diff.get("metrics", {}).get("bytes_scanned_after", 0)  if isinstance(explain_diff, dict) else 0
-            bytes_pct    = 0.0
+            metrics = explain_diff.get("metrics", {}) if isinstance(explain_diff, dict) else {}
+            bytes_before = metrics.get("bytes_scanned_before", 0)
+            bytes_after  = metrics.get("bytes_scanned_after", 0)
+            bytes_pct    = metrics.get("bytes_scanned_reduction_pct", 0.0)
 
-        if bytes_before <= 0:
-            # Fall back to synthetic bytes.
-            # When real telemetry is in use, derive a proxy ratio from the
-            # measured time improvement so the bytes estimate stays coherent.
-            # In mock mode `improvement_factor` is already defined above.
-            _bytes_factor = (
-                (optimized_time / original_time) if use_real else improvement_factor
-            )
-            _original_bytes  = 480_000_000_000          # 480 GB sentinel
-            _optimized_bytes = int(_original_bytes * _bytes_factor)
-            bytes_before_gb  = round(_original_bytes  / 1e9, 1)
-            bytes_after_gb   = round(_optimized_bytes / 1e9, 1)
-            bytes_pct        = round((1 - _optimized_bytes / _original_bytes) * 100, 1)
+        # Only override EXPLAIN-derived values if Snowflake returned a non-zero byte count.
+        # A value of 0 from QUERY_HISTORY_BY_SESSION typically means the result was served
+        # from cache or metadata — it is NOT a real scan measurement and must be ignored.
+        if real_optimized_bytes_scanned is not None and real_optimized_bytes_scanned > 0:
+            bytes_after = real_optimized_bytes_scanned
+            
+            # Use real_original_bytes_scanned if available, else fallback to input_data
+            if real_original_bytes_scanned is not None and real_original_bytes_scanned > 0:
+                bytes_before = int(real_original_bytes_scanned)
+            else:
+                original_bytes = input_data.get("BYTES_SCANNED", input_data.get("bytes_scanned", 0))
+                if original_bytes:
+                    bytes_before = int(original_bytes)
+                    
+            if bytes_before > 0:
+                bytes_pct = (bytes_before - bytes_after) / bytes_before * 100.0
+
+        if bytes_before > 0:
+            bytes_before_gb = round(bytes_before / 1e9, 1)
+            bytes_after_gb  = round(bytes_after  / 1e9, 1)
+            bytes_pct       = round(bytes_pct, 1)
         else:
-            bytes_before_gb  = round(bytes_before / 1e9, 1)
-            bytes_after_gb   = round(bytes_after  / 1e9, 1)
-            bytes_pct        = round(bytes_pct, 1)
+            # No real bytes data — report 0.0 instead of fabricating numbers
+            bytes_before_gb = 0.0
+            bytes_after_gb  = 0.0
+            bytes_pct       = 0.0
+            logger.info(
+                "PerformanceComparisonEngine: no EXPLAIN bytes data — "
+                "reporting 0.0 (no fabricated bytes)"
+            )
 
         # ── Partition pruning ────────────────────────────────────────────────
-        # Use real partitionsAssigned and partitionsTotal from the EXPLAIN diff
-        # when available. Pruning % = (1 - assigned / total) * 100.
         try:
             _p_before = explain_diff.metrics.partitions_before
             _p_after  = explain_diff.metrics.partitions_after
             _p_total_before = explain_diff.metrics.partitions_total_before
             _p_total_after  = explain_diff.metrics.partitions_total_after
         except AttributeError:
-            _p_before = 0
-            _p_after = 0
-            _p_total_before = 0
-            _p_total_after = 0
+            metrics = explain_diff.get("metrics", {}) if isinstance(explain_diff, dict) else {}
+            _p_before = metrics.get("partitions_before", 0)
+            _p_after = metrics.get("partitions_after", 0)
+            _p_total_before = metrics.get("partitions_total_before", 0)
+            _p_total_after = metrics.get("partitions_total_after", 0)
+            
+        if real_optimized_partitions_scanned is not None and real_optimized_partitions_total is not None:
+            _p_after = real_optimized_partitions_scanned
+            _p_total_after = real_optimized_partitions_total
+            
+            if real_original_partitions_scanned is not None:
+                _p_before = int(real_original_partitions_scanned)
+            else:
+                original_p = input_data.get("PARTITIONS_SCANNED", input_data.get("partitions_scanned", 0))
+                if original_p:
+                    _p_before = int(original_p)
+                    
+            if real_original_partitions_total is not None:
+                _p_total_before = int(real_original_partitions_total)
+            else:
+                original_pt = input_data.get("PARTITIONS_TOTAL", input_data.get("partitions_total", 0))
+                if original_pt:
+                    _p_total_before = int(original_pt)
 
-        if _p_total_before > 0 and _p_total_after > 0:
-            pruning_before = round((1 - _p_before / _p_total_before) * 100, 1)
-            pruning_after  = round((1 - _p_after / _p_total_after) * 100, 1)
+        if _p_total_before > 0:
+            baseline_total = max(_p_total_before, _p_total_after)
+            pruning_before = round((1 - _p_before / baseline_total) * 100, 1)
+            pruning_after  = round((1 - _p_after / baseline_total) * 100, 1)
             logger.info(
                 "PerformanceComparisonEngine: real pruning data "
                 "(before: %d/%d assigned, after: %d/%d assigned; pruning_pct: %.1f%% -> %.1f%%)",
-                _p_before, _p_total_before, _p_after, _p_total_after,
+                _p_before, baseline_total, _p_after, baseline_total,
                 pruning_before, pruning_after
             )
         else:
-            # Heuristic fallback when no EXPLAIN partition data is present
-            pruning_before = 3.0
-            pruning_after  = float(min(91, 3 + change_count * 28))
-            logger.debug(
+            # No partition data — report 0.0 instead of fabricating
+            pruning_before = 0.0
+            pruning_after  = 0.0
+            logger.info(
                 "PerformanceComparisonEngine: no EXPLAIN partition data — "
-                "using heuristic pruning estimate"
+                "reporting 0.0 (no fabricated pruning)"
             )
 
         # ── Improvement percentages ──────────────────────────────────────────
-        time_pct    = round((1 - optimized_time    / original_time)    * 100, 1)
-        credits_pct = round((1 - optimized_credits / original_credits) * 100, 1)
+        time_pct    = round((1 - optimized_time    / original_time)    * 100, 1) if original_time > 0 else 0.0
+        credits_pct = round((1 - optimized_credits / original_credits) * 100, 1) if original_credits > 0 else 0.0
+
+        # Log regressions clearly
+        if time_pct < 0:
+            logger.warning(
+                "PerformanceComparisonEngine: REGRESSION detected — "
+                "execution time increased by %.1f%% (%.2fs → %.2fs)",
+                abs(time_pct), original_time, optimized_time,
+            )
+        if credits_pct < 0:
+            logger.warning(
+                "PerformanceComparisonEngine: REGRESSION detected — "
+                "credits increased by %.1f%% (%.4f → %.4f)",
+                abs(credits_pct), original_credits, optimized_credits,
+            )
 
         before = PerformanceSnapshot(
             execution_time_sec=original_time,
@@ -210,9 +269,6 @@ class PerformanceComparisonEngine:
         """
         Convert a PerformanceDiff into the legacy metrics dict shape
         expected by ReportAgent, PRAgent, and the rest of the pipeline.
-
-        This ensures full backward compatibility while the internals
-        are now cleanly computed by this engine.
         """
         return {
             "execution_time": {
@@ -233,6 +289,7 @@ class PerformanceComparisonEngine:
             "partition_pruning": {
                 "before_pct":       diff.before.partition_pruning_pct,
                 "after_pct":        diff.after.partition_pruning_pct,
+                "improvement_pct":  diff.pruning_improvement_pct,
             },
         }
 
@@ -242,16 +299,19 @@ class PerformanceComparisonEngine:
     def _compute_score(
         time_pct: float, credits_pct: float, bytes_pct: float
     ) -> float:
-        """Weighted composite score: 0-100."""
+        """Weighted composite score: -100 to +100. Negative = regression."""
         score = (
-            max(0.0, time_pct)    * _W_TIME
-            + max(0.0, credits_pct) * _W_CREDITS
-            + max(0.0, bytes_pct)   * _W_BYTES
+            time_pct    * _W_TIME
+            + credits_pct * _W_CREDITS
+            + bytes_pct   * _W_BYTES
         )
-        return round(min(score, 100.0), 1)
+        return round(max(-100.0, min(score, 100.0)), 1)
 
     @staticmethod
     def _score_to_verdict(score: float) -> str:
+        """Map score to verdict. Negative scores → REGRESSION."""
+        if score < 0:
+            return "REGRESSION"
         for threshold, label in _VERDICT_THRESHOLDS:
             if score >= threshold:
                 return label

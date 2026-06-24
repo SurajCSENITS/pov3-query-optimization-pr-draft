@@ -47,7 +47,7 @@ class PRAgent(BaseAgent):
             insights_section = ""
 
         # LLM metadata section
-        opt_mode = report.get("optimization_mode", "rule_based")
+        opt_mode = report.get("optimization_mode", "unavailable")
         llm_meta = ""
         if opt_mode == "llm":
             llm_meta = (

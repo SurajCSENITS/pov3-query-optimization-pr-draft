@@ -1,18 +1,23 @@
 """
-RAG Manager — retrieves relevant past optimization cases from the
-Amazon Bedrock Knowledge Base.
+RAG Manager — LangChain AmazonKnowledgeBasesRetriever Integration.
 
-At optimization time, this manager queries the vector index for
-the top-K most similar past optimization reports. These are injected
-as few-shot examples into the Optimization Agent's prompt, enabling
-the LLM to leverage past successes.
+Replaces the custom boto3 Knowledge Base wrapper with LangChain's
+native AmazonKnowledgeBasesRetriever, which provides:
+  - Standard BaseRetriever interface (compatible with LCEL chains)
+  - Automatic Document object creation
+  - Seamless LangSmith tracing
 
 Usage:
-    from src.connectors.rag_manager import get_rag_manager
-    manager = get_rag_manager()
-    context = manager.retrieve_similar_cases(
-        bottleneck_types=["FULL_COLUMN_SCAN", "NON_SARGABLE_PREDICATE"],
-        sql_fragment="SELECT * FROM orders WHERE YEAR(order_date) = 2025",
+    from src.connectors.rag_manager import get_retriever, retrieve_and_format
+
+    # Get a retriever for use in LCEL chains:
+    retriever = get_retriever()
+    docs = retriever.invoke("FULL_COLUMN_SCAN optimization for SELECT *")
+
+    # Or use the convenience function for few-shot context:
+    context = retrieve_and_format(
+        bottleneck_types=["FULL_COLUMN_SCAN"],
+        sql_fragment="SELECT * FROM orders...",
     )
 """
 
@@ -29,147 +34,106 @@ logger = logging.getLogger(__name__)
 _DEFAULT_TOP_K = 3
 
 
-class RAGManager:
+def get_retriever(top_k: int = _DEFAULT_TOP_K) -> Any:
     """
-    Wrapper around Amazon Bedrock Knowledge Base Retrieve API.
+    Return a configured AmazonKnowledgeBasesRetriever instance.
 
-    Retrieves semantically similar past optimization reports
-    to use as RAG context in the Optimization Agent prompt.
+    Returns None if RAG is not configured (bedrock_kb_id not set).
+    The retriever implements LangChain's BaseRetriever interface.
     """
+    settings = get_settings()
 
-    _instance: RAGManager | None = None
-    _client: Any = None
+    if not settings.rag_configured:
+        logger.info("RAG not configured — retriever unavailable")
+        return None
 
-    def __new__(cls) -> RAGManager:
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    from langchain_aws.retrievers import AmazonKnowledgeBasesRetriever
 
-    def __init__(self) -> None:
-        self._settings = get_settings()
+    retriever = AmazonKnowledgeBasesRetriever(
+        knowledge_base_id=settings.bedrock_kb_id,
+        retrieval_config={
+            "vectorSearchConfiguration": {
+                "numberOfResults": top_k,
+            }
+        },
+        region_name=settings.aws_region,
+        credentials_profile_name=None,
+    )
 
-    def _get_client(self) -> Any:
-        """Lazily create and return the boto3 bedrock-agent-runtime client."""
-        if self._client is None:
-            import boto3
-
-            self._client = boto3.client(
-                "bedrock-agent-runtime",
-                region_name=self._settings.aws_region,
-                aws_access_key_id=self._settings.aws_access_key_id,
-                aws_secret_access_key=self._settings.aws_secret_access_key,
-            )
-            logger.info(
-                "Bedrock agent-runtime client created (region=%s, kb=%s)",
-                self._settings.aws_region,
-                self._settings.bedrock_kb_id,
-            )
-        return self._client
-
-    # ── Retrieval ──────────────────────────────────────────────────────────────
-
-    def retrieve_similar_cases(
-        self,
-        bottleneck_types: list[str],
-        sql_fragment: str,
-        top_k: int = _DEFAULT_TOP_K,
-    ) -> list[dict[str, Any]]:
-        """
-        Retrieve top-K past optimization cases similar to the current query.
-
-        Constructs a semantic search query from the bottleneck types and SQL
-        pattern, then fetches matching documents from the Bedrock KB vector
-        index.
-
-        Args:
-            bottleneck_types: List of detected bottleneck type strings.
-            sql_fragment:     First ~200 chars of the original SQL query.
-            top_k:            Number of similar cases to retrieve.
-
-        Returns:
-            List of retrieved case dicts, each containing:
-                - content: str  (text chunk from the report)
-                - score:   float (relevance score 0.0–1.0)
-                - source:  str  (S3 key of the source document)
-
-        Returns [] if RAG is not configured or retrieval fails.
-        """
-        if not self._settings.rag_configured:
-            logger.info("RAG not configured — skipping similar case retrieval")
-            return []
-
-        # ── Build the search query ─────────────────────────────────────────
-        bottleneck_str = ", ".join(bottleneck_types) if bottleneck_types else "general"
-        query = (
-            f"Snowflake SQL optimization for bottlenecks: {bottleneck_str}. "
-            f"Query pattern: {sql_fragment[:200]}"
-        )
-
-        try:
-            client = self._get_client()
-            response = client.retrieve(
-                knowledgeBaseId=self._settings.bedrock_kb_id,
-                retrievalQuery={"text": query},
-                retrievalConfiguration={
-                    "vectorSearchConfiguration": {
-                        "numberOfResults": top_k,
-                    }
-                },
-            )
-
-            results = []
-            for item in response.get("retrievalResults", []):
-                content = item.get("content", {}).get("text", "")
-                score = item.get("score", 0.0)
-                source = (
-                    item.get("location", {})
-                    .get("s3Location", {})
-                    .get("uri", "unknown")
-                )
-                if content:
-                    results.append({
-                        "content": content,
-                        "score": score,
-                        "source": source,
-                    })
-
-            logger.info(
-                "RAG retrieved %d similar cases (kb=%s)",
-                len(results),
-                self._settings.bedrock_kb_id,
-            )
-            return results
-
-        except Exception as e:
-            logger.warning("RAG retrieval failed (non-fatal): %s", e)
-            return []
-
-    def format_as_few_shot_context(
-        self, cases: list[dict[str, Any]]
-    ) -> str:
-        """
-        Format retrieved cases as a few-shot context string for the LLM prompt.
-
-        Args:
-            cases: List returned by retrieve_similar_cases().
-
-        Returns:
-            Formatted multi-line string ready to inject into an LLM prompt,
-            or an empty string if no cases were retrieved.
-        """
-        if not cases:
-            return ""
-
-        lines = ["## Relevant Past Optimization Cases\n"]
-        for i, case in enumerate(cases, 1):
-            score_pct = round(case["score"] * 100, 1)
-            lines.append(f"### Case {i} (Relevance: {score_pct}%)")
-            lines.append(case["content"])
-            lines.append("")
-
-        return "\n".join(lines)
+    logger.info(
+        "AmazonKnowledgeBasesRetriever created (kb=%s, top_k=%d)",
+        settings.bedrock_kb_id,
+        top_k,
+    )
+    return retriever
 
 
-def get_rag_manager() -> RAGManager:
-    """Return the process-wide singleton RAGManager."""
-    return RAGManager()
+def retrieve_similar_cases(
+    bottleneck_types: list[str],
+    sql_fragment: str,
+    top_k: int = _DEFAULT_TOP_K,
+) -> list[dict[str, Any]]:
+    """
+    Retrieve similar past optimization cases from the Knowledge Base.
+
+    Builds a semantic search query from bottleneck types and SQL pattern,
+    then fetches matching documents. Returns a list of dicts compatible
+    with the existing pipeline format.
+
+    Returns [] if RAG is not configured or retrieval fails.
+    """
+    retriever = get_retriever(top_k=top_k)
+    if retriever is None:
+        return []
+
+    # Build the search query
+    bottleneck_str = ", ".join(bottleneck_types) if bottleneck_types else "general"
+    query = (
+        f"Snowflake SQL optimization for bottlenecks: {bottleneck_str}. "
+        f"Query pattern: {sql_fragment[:200]}"
+    )
+
+    try:
+        docs = retriever.invoke(query)
+
+        results = []
+        for doc in docs:
+            content = doc.page_content
+            score = doc.metadata.get("score", 0.0)
+            source = doc.metadata.get("source", doc.metadata.get("location", {}).get("s3Location", {}).get("uri", "unknown"))
+            if content:
+                results.append({
+                    "content": content,
+                    "score": score,
+                    "source": source,
+                })
+
+        logger.info("RAG retrieved %d similar cases", len(results))
+        return results
+
+    except Exception as e:
+        logger.warning("RAG retrieval failed (non-fatal): %s", e)
+        return []
+
+
+def format_as_few_shot_context(cases: list[dict[str, Any]]) -> str:
+    """
+    Format retrieved cases as a few-shot context string for LLM prompts.
+
+    Args:
+        cases: List returned by retrieve_similar_cases().
+
+    Returns:
+        Formatted multi-line string, or empty string if no cases.
+    """
+    if not cases:
+        return ""
+
+    lines = ["## Relevant Past Optimization Cases\n"]
+    for i, case in enumerate(cases, 1):
+        score_pct = round(case.get("score", 0) * 100, 1)
+        lines.append(f"### Case {i} (Relevance: {score_pct}%)")
+        lines.append(case["content"])
+        lines.append("")
+
+    return "\n".join(lines)

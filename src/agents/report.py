@@ -63,21 +63,35 @@ class ReportAgent(BaseAgent):
                 "reason": change.get("reason", f"Resolves {change.get('type', '')} bottleneck"),
             })
 
+        # ── Helper: format a metric delta with correct sign-aware wording ──────
+        def _fmt_metric(pct: float, unit: str = "%") -> str:
+            """Return a human-readable delta string, correctly handling regressions."""
+            if pct > 0:
+                return f"-{pct}{unit} ✅"
+            elif pct < 0:
+                return f"+{abs(pct)}{unit} 🔴 REGRESSION"
+            else:
+                return f"0{unit} (no change)"
+
+        time_pct    = metrics["execution_time"]["improvement_pct"]
+        credits_pct = metrics["credits"]["improvement_pct"]
+        bytes_pct   = metrics["bytes_scanned"]["improvement_pct"]
+
         performance_table = {
             "execution_time": (
                 f"{metrics['execution_time']['before_sec']}s → "
                 f"{metrics['execution_time']['after_sec']}s "
-                f"(-{metrics['execution_time']['improvement_pct']}%)"
+                f"({_fmt_metric(time_pct)})"
             ),
             "credits_consumed": (
                 f"{metrics['credits']['before']} → "
                 f"{metrics['credits']['after']} "
-                f"(-{metrics['credits']['improvement_pct']}%)"
+                f"({_fmt_metric(credits_pct)})"
             ),
             "bytes_scanned": (
                 f"{metrics['bytes_scanned']['before_gb']} GB → "
                 f"{metrics['bytes_scanned']['after_gb']} GB "
-                f"(-{metrics['bytes_scanned']['improvement_pct']}%)"
+                f"({_fmt_metric(bytes_pct)})"
             ),
             "partition_pruning": (
                 f"{metrics['partition_pruning']['before_pct']}% → "
@@ -87,13 +101,33 @@ class ReportAgent(BaseAgent):
 
         decision = validation.get("decision", "APPROVED")
         decision_icon = {"APPROVED": "✅", "REVIEW": "⚠️", "REJECTED": "❌"}.get(decision, "?")
-        summary = (
-            f"Optimized query {analysis['query_id']} by applying "
-            f"{optimization.get('change_count', 0)} changes, reducing execution time "
-            f"by {metrics['execution_time']['improvement_pct']}% and credit "
-            f"consumption by {metrics['credits']['improvement_pct']}%. "
-            f"Validation: {decision}."
-        )
+
+        # ── Build an accurate summary — never claim improvement if regressing ──
+        change_count = optimization.get("change_count", 0)
+
+        def _describe_metric(label: str, pct: float) -> str:
+            if pct > 0:
+                return f"reducing {label} by {pct}%"
+            elif pct < 0:
+                return f"INCREASING {label} by {abs(pct)}% (REGRESSION)"
+            else:
+                return f"{label} unchanged"
+
+        if decision == "REJECTED":
+            summary = (
+                f"Optimization REJECTED for query {analysis['query_id']} — "
+                f"{_describe_metric('execution time', time_pct)}, "
+                f"{_describe_metric('credit consumption', credits_pct)}. "
+                f"The optimized query performs WORSE than the original and was not approved."
+            )
+        else:
+            summary = (
+                f"Optimized query {analysis['query_id']} by applying "
+                f"{change_count} change(s), "
+                f"{_describe_metric('execution time', time_pct)} and "
+                f"{_describe_metric('credit consumption', credits_pct)}. "
+                f"Validation: {decision}."
+            )
 
         # ── Explain diff insights ────────────────────────────────────────────
         explain_diff = validation.get("explain_diff", {})
@@ -115,10 +149,10 @@ class ReportAgent(BaseAgent):
                 == validation.get("row_count_optimized", 0)
             ),
             "explain_diff_insights": diff_insights,
-            "optimization_mode": optimization.get("optimization_mode", "rule_based"),
+            "optimization_mode": optimization.get("optimization_mode", "unavailable"),
             "llm_model": optimization.get("llm_model", ""),
             "rag_cases_used": optimization.get("rag_cases_used", 0),
-            "confidence_score": validation.get("confidence_score", 0.85),
+            "confidence_score": validation.get("confidence_score"),
             "s3_key": s3_key,
         }
 

@@ -1,20 +1,24 @@
 """
-Analysis Agent — identifies performance bottlenecks in the query.
+Analysis Agent — LLM-powered bottleneck identification.
+
+Replaces the MVP's regex-based bottleneck detection with LLM-guided
+analysis. The agent identifies performance issues using the LLM's
+understanding of SQL anti-patterns, EXPLAIN plans, and execution history.
 
 Operates in two modes:
-  1. SNOWFLAKE MODE: Executes EXPLAIN and queries QUERY_HISTORY for real
-     performance metadata. Activated when Snowflake is configured and enabled.
-  2. MOCK MODE: Uses rule-based regex heuristics on the SQL text.
-     This is the fallback when Snowflake is unavailable.
+  1. SNOWFLAKE MODE: Fetches real EXPLAIN and QUERY_HISTORY metadata,
+     passes them as context to the LLM for informed analysis.
+  2. STANDALONE MODE: Passes only the raw SQL to the LLM. The LLM
+     identifies bottlenecks from SQL text patterns alone.
 
-Both modes produce the same output schema, so downstream agents
-(OptimizationAgent, etc.) work identically regardless of mode.
+Both modes use the same LLM-backed analysis — no regex rules.
+Falls back to a minimal static response only when Bedrock is
+completely unavailable.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
 from src.agents.base import BaseAgent, console
@@ -34,13 +38,37 @@ class AnalysisAgent(BaseAgent):
         sql = data.get("query_text", "")
         settings = get_settings()
 
-        # ── Choose execution mode ───────────────────────────────
+        # ── Collect Snowflake context (if available) ────────────
+        query_plan_text = ""
+        snowflake_metadata: dict[str, Any] = {}
+
         if settings.snowflake_configured:
-            console.print("  🔗 [bold blue]Mode: SNOWFLAKE[/] — using real metadata")
-            analysis_output = self._analyze_with_snowflake(data, sql)
+            console.print("  🔗 [bold blue]Mode: SNOWFLAKE[/] — fetching real metadata")
+            query_plan_text, snowflake_metadata = self._fetch_snowflake_context(data, sql)
         else:
-            console.print("  🧪 [bold yellow]Mode: MOCK[/] — using rule-based heuristics")
-            analysis_output = self._analyze_with_mock(data, sql)
+            console.print("  🧪 [bold yellow]Mode: STANDALONE[/] — SQL text analysis only")
+
+        # ── LLM-backed analysis ─────────────────────────────────
+        if settings.bedrock_configured:
+            console.print(
+                f"  🤖 Analyzing bottlenecks via [bold cyan]"
+                f"{settings.bedrock_screener_model_id}[/]..."
+            )
+            analysis_output = self._analyze_with_llm(
+                data, sql, query_plan_text, snowflake_metadata
+            )
+        else:
+            console.print(
+                "  ⚠️  [yellow]Bedrock not configured — returning minimal analysis[/]"
+            )
+            analysis_output = self._minimal_fallback(data, sql)
+
+        # ── Attach Snowflake context to output ──────────────────
+        analysis_output["query_plan"] = query_plan_text
+        analysis_output["snowflake_metadata"] = snowflake_metadata
+        analysis_output["analysis_mode"] = (
+            "snowflake" if settings.snowflake_configured else "standalone"
+        )
 
         # ── Pretty-print findings ───────────────────────────────
         for b in analysis_output["bottlenecks"]:
@@ -64,54 +92,126 @@ class AnalysisAgent(BaseAgent):
             ),
         }
 
-    # ── Snowflake-backed analysis ───────────────────────────────
+    # ── LLM-backed analysis ─────────────────────────────────────
 
-    def _analyze_with_snowflake(
+    def _analyze_with_llm(
+        self,
+        data: dict[str, Any],
+        sql: str,
+        explain_plan: str,
+        snowflake_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Use the LLM to identify bottlenecks in the SQL query.
+
+        Passes the SQL, EXPLAIN plan, and QUERY_HISTORY metadata
+        as context to the LLM. Returns structured bottleneck data.
+        """
+        from src.connectors.bedrock_manager import get_llm
+        from src.models.llm_outputs import BottleneckAnalysis
+        from src.prompts.analysis_prompt import (
+            ANALYSIS_PROMPT,
+            format_explain_plan_section,
+            format_query_history_section,
+        )
+
+        try:
+            llm = get_llm(temperature=0.1).with_structured_output(BottleneckAnalysis)
+
+            result: BottleneckAnalysis = (ANALYSIS_PROMPT | llm).invoke({
+                "sql": sql,
+                "explain_plan_section": format_explain_plan_section(explain_plan),
+                "query_history_section": format_query_history_section(snowflake_metadata),
+            })
+
+            # Convert Pydantic models to dicts for pipeline compatibility
+            bottlenecks = [b.model_dump() for b in result.bottlenecks]
+
+            console.print(
+                f"  ✅ LLM analysis complete — {len(bottlenecks)} bottleneck(s), "
+                f"reasoning: {result.reasoning[:80]}..."
+                if result.reasoning else
+                f"  ✅ LLM analysis complete — {len(bottlenecks)} bottleneck(s)"
+            )
+
+            return {
+                "query_id": data.get("query_id", "unknown"),
+                "original_sql": sql,
+                "bottlenecks": bottlenecks,
+                "bottleneck_count": len(bottlenecks),
+                "severity_score": result.severity_score,
+                "recommendation": result.recommendation,
+                "llm_reasoning": result.reasoning,
+            }
+
+        except Exception as e:
+            logger.warning("LLM analysis failed, using minimal fallback: %s", e)
+            console.print(
+                f"  ⚠️  [yellow]LLM analysis failed ({e}) — using minimal fallback[/]"
+            )
+            return self._minimal_fallback(data, sql)
+
+    # ── Minimal fallback (no LLM available) ─────────────────────
+
+    def _minimal_fallback(
         self, data: dict[str, Any], sql: str
     ) -> dict[str, Any]:
         """
-        Fetch real execution metadata from Snowflake:
-        1. EXPLAIN USING TEXT for the query plan
-        2. QUERY_HISTORY for execution stats
-        3. Combine with rule-based heuristics
+        Minimal static response when both Snowflake and Bedrock
+        are unavailable. Does NOT apply regex rules — simply reports
+        that analysis could not be performed and recommends manual review.
+        """
+        return {
+            "query_id": data.get("query_id", "unknown"),
+            "original_sql": sql,
+            "bottlenecks": [],
+            "bottleneck_count": 0,
+            "severity_score": 0,
+            "recommendation": "MANUAL_REVIEW",
+            "llm_reasoning": (
+                "Automated analysis unavailable — Bedrock LLM is not configured. "
+                "Manual review recommended."
+            ),
+            "query_plan": "",
+            "snowflake_metadata": {},
+            "analysis_mode": "unavailable",
+        }
+
+    # ── Snowflake context fetching ──────────────────────────────
+
+    def _fetch_snowflake_context(
+        self, data: dict[str, Any], sql: str
+    ) -> tuple[str, dict[str, Any]]:
+        """
+        Fetch EXPLAIN plan and QUERY_HISTORY from Snowflake.
+
+        Returns (plan_text, metadata_dict). Non-fatal — returns
+        empty values on any failure.
         """
         from src.connectors.snowflake_manager import get_connection_manager
 
         manager = get_connection_manager()
-        bottlenecks: list[dict[str, str]] = []
         query_plan_text = ""
         snowflake_metadata: dict[str, Any] = {}
 
-        # ── Step 1: Run EXPLAIN ─────────────────────────────────
+        # ── EXPLAIN plan ────────────────────────────────────────
         try:
             explain_results = manager.explain_query(sql)
             if explain_results:
-                # EXPLAIN returns rows with plan details
                 plan_lines = []
                 for row in explain_results:
-                    # Snowflake EXPLAIN USING TEXT returns a single-column result
-                    for col_name, col_val in row.items():
+                    for col_val in row.values():
                         if col_val:
                             plan_lines.append(str(col_val))
                 query_plan_text = "\n".join(plan_lines)
-                console.print(f"  📋 EXPLAIN plan retrieved ({len(explain_results)} rows)")
-
-                # Detect issues from the EXPLAIN plan
-                plan_lower = query_plan_text.lower()
-                if "tableScan" in query_plan_text or "table scan" in plan_lower:
-                    bottlenecks.append({
-                        "id": "B001",
-                        "type": "FULL_TABLE_SCAN",
-                        "severity": "HIGH",
-                        "description": "Full table scan detected in query plan",
-                        "location": "EXPLAIN plan",
-                    })
-
+                console.print(
+                    f"  📋 EXPLAIN plan retrieved ({len(explain_results)} rows)"
+                )
         except Exception as e:
-            logger.warning("EXPLAIN failed, falling back to heuristics: %s", e)
+            logger.warning("EXPLAIN failed: %s", e)
             console.print(f"  ⚠️  EXPLAIN failed: {e}")
 
-        # ── Step 2: Fetch QUERY_HISTORY ─────────────────────────
+        # ── QUERY_HISTORY ───────────────────────────────────────
         query_id = data.get("query_id", "")
         try:
             history = manager.get_query_history(
@@ -136,157 +236,12 @@ class AnalysisAgent(BaseAgent):
                     f"  📊 QUERY_HISTORY: exec={snowflake_metadata.get('execution_time_seconds')}s, "
                     f"bytes={snowflake_metadata.get('bytes_scanned')}"
                 )
-
-                # Detect spilling from real metadata
-                spill_remote = record.get("BYTES_SPILLED_TO_REMOTE_STORAGE", 0) or 0
-                spill_local = record.get("BYTES_SPILLED_TO_LOCAL_STORAGE", 0) or 0
-                if spill_remote > 0:
-                    bottlenecks.append({
-                        "id": "B003",
-                        "type": "REMOTE_SPILL",
-                        "severity": "CRITICAL",
-                        "description": f"Query spills {spill_remote:,} bytes to remote storage",
-                        "location": "Execution engine",
-                    })
-                elif spill_local > 0:
-                    bottlenecks.append({
-                        "id": "B003",
-                        "type": "LOCAL_SPILL",
-                        "severity": "HIGH",
-                        "description": f"Query spills {spill_local:,} bytes to local storage",
-                        "location": "Execution engine",
-                    })
-
-                # Detect poor partition pruning
-                parts_scanned = record.get("PARTITIONS_SCANNED", 0) or 0
-                parts_total = record.get("PARTITIONS_TOTAL", 1) or 1
-                if parts_total > 0:
-                    prune_pct = (1 - parts_scanned / parts_total) * 100
-                    if prune_pct < 20:
-                        bottlenecks.append({
-                            "id": "B005",
-                            "type": "POOR_PARTITION_PRUNING",
-                            "severity": "HIGH",
-                            "description": (
-                                f"Only {prune_pct:.0f}% of partitions pruned "
-                                f"({parts_scanned}/{parts_total} scanned)"
-                            ),
-                            "location": "Storage layer",
-                        })
-
             else:
-                console.print("  ℹ️  No QUERY_HISTORY records found (may be within 45-min latency)")
-
+                console.print(
+                    "  ℹ️  No QUERY_HISTORY records found (may be within 45-min latency)"
+                )
         except Exception as e:
             logger.warning("QUERY_HISTORY fetch failed: %s", e)
             console.print(f"  ⚠️  QUERY_HISTORY unavailable: {e}")
 
-        # ── Step 3: Always apply SQL heuristics too ─────────────
-        bottlenecks.extend(self._detect_sql_patterns(data, sql))
-
-        # Deduplicate by bottleneck type
-        seen_types = set()
-        unique_bottlenecks = []
-        for b in bottlenecks:
-            if b["type"] not in seen_types:
-                seen_types.add(b["type"])
-                unique_bottlenecks.append(b)
-
-        severity_score = self._compute_severity(unique_bottlenecks)
-
-        return {
-            "query_id": data.get("query_id", "unknown"),
-            "original_sql": sql,
-            "bottlenecks": unique_bottlenecks,
-            "bottleneck_count": len(unique_bottlenecks),
-            "severity_score": severity_score,
-            "recommendation": "OPTIMIZE" if unique_bottlenecks else "NO_ACTION",
-            "query_plan": query_plan_text,
-            "snowflake_metadata": snowflake_metadata,
-            "analysis_mode": "snowflake",
-        }
-
-    # ── Mock/regex-based analysis (original MVP logic) ──────────
-
-    def _analyze_with_mock(
-        self, data: dict[str, Any], sql: str
-    ) -> dict[str, Any]:
-        """Original MVP analysis using regex pattern matching."""
-        bottlenecks = self._detect_sql_patterns(data, sql)
-
-        # Check metadata-based issues
-        if data.get("issue_type") == "REMOTE_SPILL":
-            bottlenecks.append({
-                "id": "B003",
-                "type": "REMOTE_SPILL",
-                "severity": "CRITICAL",
-                "description": "Query spills data to remote storage — major performance degradation",
-                "location": "Execution engine",
-            })
-
-        severity_score = self._compute_severity(bottlenecks)
-
-        return {
-            "query_id": data.get("query_id", "unknown"),
-            "original_sql": sql,
-            "bottlenecks": bottlenecks,
-            "bottleneck_count": len(bottlenecks),
-            "severity_score": severity_score,
-            "recommendation": "OPTIMIZE" if bottlenecks else "NO_ACTION",
-            "query_plan": "",
-            "snowflake_metadata": {},
-            "analysis_mode": "mock",
-        }
-
-    # ── Shared helpers ──────────────────────────────────────────
-
-    @staticmethod
-    def _detect_sql_patterns(
-        data: dict[str, Any], sql: str
-    ) -> list[dict[str, str]]:
-        """
-        Regex-based SQL pattern detection.
-        Used in both Snowflake and mock modes.
-        """
-        bottlenecks: list[dict[str, str]] = []
-
-        if re.search(r"SELECT\s+\*", sql, re.IGNORECASE):
-            bottlenecks.append({
-                "id": "B001",
-                "type": "FULL_COLUMN_SCAN",
-                "severity": "HIGH",
-                "description": "SELECT * scans all columns — excessive bytes read",
-                "location": "SELECT clause",
-            })
-
-        if re.search(r"YEAR\s*\(", sql, re.IGNORECASE):
-            bottlenecks.append({
-                "id": "B002",
-                "type": "NON_SARGABLE_PREDICATE",
-                "severity": "HIGH",
-                "description": "YEAR() function wrapping column prevents micro-partition pruning",
-                "location": "WHERE clause",
-            })
-
-        if re.search(r"JOIN", sql, re.IGNORECASE) and not re.search(
-            r"WHERE.*AND", sql, re.IGNORECASE
-        ):
-            bottlenecks.append({
-                "id": "B004",
-                "type": "UNFILTERED_JOIN",
-                "severity": "MEDIUM",
-                "description": "JOIN executed without pre-filtering — large intermediate result set",
-                "location": "JOIN clause",
-            })
-
-        return bottlenecks
-
-    @staticmethod
-    def _compute_severity(bottlenecks: list[dict[str, str]]) -> int:
-        """Compute a weighted severity score from bottleneck list."""
-        return sum(
-            {"CRITICAL": 10, "HIGH": 7, "MEDIUM": 4, "LOW": 1}.get(
-                b["severity"], 1
-            )
-            for b in bottlenecks
-        )
+        return query_plan_text, snowflake_metadata

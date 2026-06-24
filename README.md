@@ -1,8 +1,8 @@
 # POV3 — Intelligent Query Optimization Platform
 
-A multi-agent orchestration pipeline using **LangGraph** that detects slow Snowflake queries, analyzes bottlenecks, optimizes the SQL using LLMs with RAG context, validates the results with safety checks and semantic screening, and generates a Draft Pull Request.
+A multi-agent orchestration pipeline using **LangGraph** and **LangChain** that detects slow Snowflake queries, analyzes bottlenecks, optimizes the SQL using LLMs with RAG context, validates the results with safety checks and semantic screening, and generates a Draft Pull Request.
 
-Features explicit **Agent-to-Agent (A2A) messaging** via Pydantic, **shared state management**, a production-ready **FastAPI web server**, **Snowflake metadata integration**, and **Amazon Bedrock (Nova Pro/Lite)** integration for advanced SQL reasoning.
+Features explicit **Agent-to-Agent (A2A) messaging**, **shared state management**, a production-ready **FastAPI web server**, **Snowflake metadata integration**, **Amazon Bedrock** integration via LangChain for advanced SQL reasoning, and comprehensive **LangSmith** observability.
 
 ---
 
@@ -26,8 +26,8 @@ Copy `.env.example` to `.env` and configure your credentials:
 ```bash
 cp .env.example .env
 ```
-Fill in your **Snowflake** and **AWS** credentials.
-*Note: The system supports graceful degradation. If Snowflake is disabled, it falls back to regex-based analysis. If AWS Bedrock is disabled, it falls back to rule-based SQL optimizations.*
+Fill in your **Snowflake**, **AWS**, and **LangSmith** credentials.
+*Note: The system supports graceful degradation. If Snowflake is disabled, it uses mock telemetry. If AWS Bedrock is disabled, agents fall back to "Manual Review Required" recommendations without applying deterministic pseudo-optimizations.*
 
 ### 3. Running the Project
 
@@ -60,7 +60,7 @@ python3 main.py
 │                                                                │
 │   AnalysisAgent ──→ OptimizationAgent ──→ ValidationAgent      │
 │         │                  │                      │            │
-│         ▼ (Metadata)       ▼ (Nova Pro + RAG)     ▼ (Safety)   │
+│         ▼ (Metadata)       ▼ (ChatBedrock + RAG)  ▼ (Safety)   │
 │     Snowflake DB     AWS Bedrock & S3      SQLSafetyEngine     │
 │                                                   │            │
 │                                                   ▼            │
@@ -87,30 +87,30 @@ python3 main.py
 ## Core Components & Engines
 
 ### 1. Agents
-* **Analysis Agent**: Connects to Snowflake to run `EXPLAIN` and check `QUERY_HISTORY`. Identifies table scans, spillage, and pruning issues. Falls back to regex heuristics if Snowflake is unavailable.
-* **Optimization Agent**: Leverages **Amazon Nova Pro** via Bedrock to rewrite SQL. Uses **RAG (Retrieval-Augmented Generation)** to fetch prior successful optimization reports from an S3-backed Bedrock Knowledge Base. Gracefully falls back to deterministic rules if the LLM is unavailable.
+* **Analysis Agent**: Connects to Snowflake to run `EXPLAIN` and check `QUERY_HISTORY`. Leverages LLM reasoning to identify table scans, spillage, and pruning issues using `ChatBedrock.with_structured_output()`.
+* **Optimization Agent**: Leverages **Amazon Bedrock** via LangChain to rewrite SQL. Uses **LangChain RAG (AmazonKnowledgeBasesRetriever)** to fetch prior successful optimization reports from an S3-backed Bedrock Knowledge Base. Fully schema-validated output via `OptimizationResult`.
 * **Validation Agent**: Uses a robust 3-stage validation process:
-  1. **SQL Safety Engine**: Deterministic AST-like safety checks (blocks DDL/DML, ensures WHERE/GROUP BY clauses are preserved).
-  2. **Explain Plan Diff Engine**: Compares Snowflake EXPLAIN plans before/after optimization, scoring the improvement based on bytes scanned and operations removed.
-  3. **Semantic Screener**: Uses **Amazon Nova Lite** to check for semantic equivalence and flag potential edge cases. Output is `APPROVED`, `REVIEW`, or `REJECTED`.
+  1. **SQL Safety Engine (Regex Layer)**: Deterministic AST-like safety checks (blocks DDL/DML, ensures WHERE/GROUP BY clauses are preserved).
+  2. **Explain Plan Diff Engine**: Compares Snowflake EXPLAIN plans before/after optimization, extracting telemetry cleanly.
+  3. **Semantic Screener (LLM Layer)**: Uses **ChatBedrock** to check for semantic equivalence and flag potential edge cases via structured output `SemanticCheckResult`. Output is `APPROVED`, `REVIEW`, or `REJECTED`.
 * **Report Agent**: Compiles all pipeline metrics into an `OptimizationReport` and uploads it to S3, continuously feeding the Bedrock Knowledge Base.
 * **PR Agent**: Generates the final GitHub Draft Pull Request payload, embedding AI metadata, explain diff insights, and the validation decision.
 
-### 2. Connectors
+### 2. Connectors (LangChain Native)
 * `SnowflakeManager`: Singleton connection pool, executes queries, fetches history, and handles auto-retries.
-* `BedrockManager`: Amazon Bedrock client for Nova Pro and Nova Lite, handles prompt invocation and JSON parsing.
-* `S3Manager`: Uploads optimization reports to S3 to feed the RAG Knowledge Base.
-* `RAGManager`: Queries the Bedrock Knowledge Base to retrieve relevant few-shot context for the LLM.
+* `ChatBedrock Factory`: Standard LangChain integration for Bedrock models supporting `.invoke()` and `.with_structured_output()`.
+* `RAGManager`: Utilizes LangChain's `AmazonKnowledgeBasesRetriever` to seamlessly inject context into optimization prompts.
 
 ### 3. Engines
-* `SQLSafetyEngine`: 9 strict deterministic safety checks (e.g. `NO_DDL_DML`, `LIMIT_NOT_REMOVED`, `WHERE_CLAUSE_PRESERVED`).
+* `SQLSafetyEngine`: Hybrid deterministic + LLM safety checks.
 * `ExplainPlanDiffEngine`: Extracts metrics and operations from raw Snowflake EXPLAIN plans to calculate performance gains.
-* `InsightGenerator`: Converts Explain Diff metrics into human-readable insights for the PR.
+* `PerformanceComparisonEngine`: Compares raw execution telemetry cleanly without artificial heuristics.
 
 ---
 
-## Agent-to-Agent (A2A) Messaging
+## Agent-to-Agent (A2A) Messaging & Observability
 
+### A2A Messaging
 Every agent communicates via structured `AgentMessage` objects. This allows tracing the exact chain of thought and communication throughout the pipeline.
 
 ```python
@@ -123,6 +123,9 @@ class AgentMessage(BaseModel):
     payload: dict         # Structured data for the receiver
 ```
 
+### LangSmith Tracing
+All agents inherit from `BaseAgent` and use the `@traceable` decorator on their `run()` loops. When `LANGSMITH_API_KEY` is configured, this provides deep, automatic tracking of token usage, latency, chain-of-thought, and state payloads natively inside the LangSmith platform.
+
 ---
 
 ## Tech Stack
@@ -130,8 +133,10 @@ class AgentMessage(BaseModel):
 | Component       | Technology                       |
 |-----------------|----------------------------------|
 | Orchestration   | LangGraph `StateGraph`           |
+| LLM Framework   | LangChain `langchain-aws`        |
+| Observability   | LangSmith `@traceable`           |
 | Web Framework   | FastAPI + Uvicorn                |
-| Cloud AI        | AWS Bedrock (Nova Pro & Lite)    |
+| Cloud AI        | AWS Bedrock                      |
 | Storage & RAG   | AWS S3 & Bedrock Knowledge Bases |
 | DB Connection   | `snowflake-connector-python`     |
 | Configuration   | `pydantic-settings` + `.env`     |

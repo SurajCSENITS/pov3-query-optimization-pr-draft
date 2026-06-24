@@ -1,7 +1,7 @@
 """
-Validation Agent — real EXPLAIN-diff + LLM semantic check + safety rules.
+Validation Agent — LLM-powered semantic check + safety rules.
 
-Replaces the MVP's mock row-count comparison with three-stage validation:
+Three-stage validation:
 
   Stage 1 — Safety Rules (SQLSafetyEngine)
     Deterministic checks: no DDL/DML, WHERE preserved, DISTINCT preserved, etc.
@@ -11,13 +11,13 @@ Replaces the MVP's mock row-count comparison with three-stage validation:
     Compares EXPLAIN plans (when Snowflake available) or mocks the diff.
     Extracts bytes/partition/operation deltas and human-readable insights.
 
-  Stage 3 — LLM Semantic Equivalence (Nova Lite screener)
-    Asks Nova Lite to confirm the two queries are semantically identical.
-    Quick, cheap check (512 tokens). Non-blocking if LLM unavailable.
+  Stage 3 — LLM Semantic Equivalence (ChatBedrock + SemanticCheckResult)
+    Uses structured output to confirm the two queries are semantically identical.
+    Returns typed SemanticCheckResult — no manual JSON parsing.
 
 Decision logic:
   - Any CRITICAL safety failure → REJECTED
-  - LLM says NOT equivalent with high confidence (≥0.85) → REVIEW
+  - LLM says NOT equivalent with high confidence → REVIEW
   - All checks pass → APPROVED
 
 The decision is stored in state and drives PR body wording.
@@ -120,7 +120,7 @@ class ValidationAgent(BaseAgent):
         console.print("  📊 Running EXPLAIN plan diff...")
         # Use query_plan from AnalysisAgent, falling back to original_explain if needed
         original_explain = analysis.get("query_plan", "") or analysis.get("original_explain", "")
-        
+
         # Fetch optimized explain plan from Snowflake if configured
         optimized_explain = ""
         if self._settings.snowflake_configured:
@@ -153,8 +153,9 @@ class ValidationAgent(BaseAgent):
 
         # ── Stage 3: LLM Semantic Check ──────────────────────────────────────
         semantic_equivalent = True
-        llm_confidence = 1.0
+        llm_confidence = 0.0
         llm_concerns: list[str] = []
+        llm_reasoning = ""
         llm_used = False
 
         if self._settings.bedrock_configured:
@@ -162,7 +163,7 @@ class ValidationAgent(BaseAgent):
                 f"  🤖 Semantic check via [bold cyan]"
                 f"{self._settings.bedrock_screener_model_id}[/]..."
             )
-            semantic_equivalent, llm_confidence, llm_concerns, llm_used = (
+            semantic_equivalent, llm_confidence, llm_concerns, llm_reasoning, llm_used = (
                 self._llm_semantic_check(original_sql, optimized_sql)
             )
         else:
@@ -170,20 +171,16 @@ class ValidationAgent(BaseAgent):
                 "  ⚠️  [yellow]Bedrock not configured — skipping LLM semantic check[/]"
             )
 
-        # ── Decision logic ───────────────────────────────────────────────────
-        decision = self._make_decision(
-            safety_report=safety_report,
-            semantic_equivalent=semantic_equivalent,
-            llm_confidence=llm_confidence,
-        )
-
         # ── Stage 3½: Live Snowflake execution (optional) ───────────────────
         real_optimized_time: float | None = None
         real_optimized_credits: float | None = None
+        real_bytes: int | None = None
+        real_parts_scanned: int | None = None
+        real_parts_total: int | None = None
 
         if self._settings.snowflake_configured:
             console.print("  ⏱️  Executing optimized query on Snowflake for real telemetry...")
-            real_optimized_time, real_optimized_credits = (
+            real_optimized_time, real_optimized_credits, real_bytes, real_parts_scanned, real_parts_total = (
                 self._execute_optimized_query(optimized_sql)
             )
             if real_optimized_time is not None:
@@ -202,16 +199,32 @@ class ValidationAgent(BaseAgent):
             )
 
         # ── Performance metrics via PerformanceComparisonEngine ───────────────
+        snowflake_metadata = analysis.get("snowflake_metadata", {})
+        
         perf_diff = self._perf_engine.from_pipeline_data(
             input_data=input_data,
             optimization=optimization,
             explain_diff=diff,
             real_optimized_time=real_optimized_time,
             real_optimized_credits=real_optimized_credits,
+            real_optimized_bytes_scanned=real_bytes,
+            real_optimized_partitions_scanned=real_parts_scanned,
+            real_optimized_partitions_total=real_parts_total,
+            real_original_bytes_scanned=snowflake_metadata.get("bytes_scanned"),
+            real_original_partitions_scanned=snowflake_metadata.get("partitions_scanned"),
+            real_original_partitions_total=snowflake_metadata.get("partitions_total"),
         )
         metrics = self._perf_engine.to_metrics_dict(perf_diff)
 
-        # ── Build ValidationEvidence bundle (Sprint 2) ──────────────────────
+        # ── Decision logic (AFTER performance, so regressions are detected) ──
+        decision = self._make_decision(
+            safety_report=safety_report,
+            semantic_equivalent=semantic_equivalent,
+            llm_confidence=llm_confidence,
+            perf_diff=perf_diff,
+        )
+
+        # ── Build ValidationEvidence bundle ──────────────────────────────────
         stage1_results: list[CheckResult] = []
         for check in safety_report.passed_checks:
             stage1_results.append(CheckResult(
@@ -244,7 +257,7 @@ class ValidationAgent(BaseAgent):
             severity="WARNING" if not semantic_equivalent else "INFO",
             detail=(
                 f"LLM confirmed {'equivalent' if semantic_equivalent else 'NOT equivalent'} "
-                f"(confidence={llm_confidence:.0%})"
+                f"(confidence={llm_confidence:.0%}). {llm_reasoning}"
             ) if llm_used else "LLM check not run (Bedrock not configured)",
             evidence=(
                 f"confidence={llm_confidence:.2f}; concerns={'; '.join(llm_concerns)}"
@@ -257,7 +270,7 @@ class ValidationAgent(BaseAgent):
             stage2_diff=diff.to_summary() if hasattr(diff, "to_summary") else _diff_to_summary(diff),
             stage3_semantic=stage3_check,
             overall_decision=decision,
-            confidence_score=llm_confidence if llm_used else 0.85,
+            confidence_score=llm_confidence if llm_used else None,
         )
 
         # ── Assemble output ──────────────────────────────────────────────────
@@ -269,6 +282,7 @@ class ValidationAgent(BaseAgent):
             "semantic_equivalent": semantic_equivalent,
             "llm_confidence": llm_confidence,
             "llm_concerns": llm_concerns,
+            "llm_reasoning": llm_reasoning,
             "llm_used": llm_used,
 
             # Safety
@@ -282,13 +296,11 @@ class ValidationAgent(BaseAgent):
             # Performance
             "metrics": metrics,
             "perf_diff": perf_diff.model_dump(),
-            "row_count_original": 2_847_391,
-            "row_count_optimized": 2_847_391,
 
             # Convenience fields used by ReportAgent
-            "confidence_score": llm_confidence if llm_used else 0.85,
+            "confidence_score": llm_confidence if llm_used else None,
 
-            # Sprint 2: structured evidence bundle
+            # Structured evidence bundle
             "validation_evidence": evidence.model_dump(),
         }
 
@@ -300,21 +312,40 @@ class ValidationAgent(BaseAgent):
             f"semantic={'PASS' if semantic_equivalent else 'FAIL'}, "
             f"confidence={llm_confidence:.0%})"
         )
-        console.print(
-            f"  ⏱  Execution: {metrics['execution_time']['before_sec']}s → "
-            f"{metrics['execution_time']['after_sec']}s "
-            f"([green]-{metrics['execution_time']['improvement_pct']}%[/])"
-        )
-        console.print(
-            f"  💰 Credits: {metrics['credits']['before']} → "
-            f"{metrics['credits']['after']} "
-            f"([green]-{metrics['credits']['improvement_pct']}%[/])"
-        )
-        console.print(
-            f"  📦 Bytes: {metrics['bytes_scanned']['before_gb']} GB → "
-            f"{metrics['bytes_scanned']['after_gb']} GB "
-            f"([green]-{metrics['bytes_scanned']['improvement_pct']}%[/])"
-        )
+
+        if metrics.get("execution_time", {}).get("before_sec") is not None:
+            time_pct = metrics['execution_time']['improvement_pct']
+            credits_pct = metrics['credits']['improvement_pct']
+            bytes_pct = metrics['bytes_scanned']['improvement_pct']
+
+            def _fmt_pct(pct: float) -> str:
+                """Format percentage with color: green for improvement, red for regression."""
+                if pct > 0:
+                    return f"[green]↓{pct}%[/]"
+                elif pct < 0:
+                    return f"[red]↑{abs(pct)}% REGRESSION[/]"
+                else:
+                    return f"[dim]0.0% (no change)[/]"
+
+            console.print(
+                f"  ⏱  Execution: {metrics['execution_time']['before_sec']}s → "
+                f"{metrics['execution_time']['after_sec']}s "
+                f"({_fmt_pct(time_pct)})"
+            )
+            console.print(
+                f"  💰 Credits: {metrics['credits']['before']} → "
+                f"{metrics['credits']['after']} "
+                f"({_fmt_pct(credits_pct)})"
+            )
+            console.print(
+                f"  📦 Bytes: {metrics['bytes_scanned']['before_gb']} GB → "
+                f"{metrics['bytes_scanned']['after_gb']} GB "
+                f"({_fmt_pct(bytes_pct)})"
+            )
+        else:
+            console.print(
+                "  ℹ️  Performance metrics: N/A (no real telemetry available)"
+            )
 
         return {
             "state_key": "validation",
@@ -323,8 +354,6 @@ class ValidationAgent(BaseAgent):
             "task_desc": (
                 f"Generate optimization report — validation {decision}"
             ),
-            # Sprint 2: expose evidence bundle directly on the state patch
-            # so base.run() writes it under the 'validation_evidence' state key
             "extra_state": {"validation_evidence": evidence.model_dump()},
         }
 
@@ -333,25 +362,14 @@ class ValidationAgent(BaseAgent):
     def _execute_optimized_query(
         self,
         optimized_sql: str,
-    ) -> tuple[float | None, float | None]:
+    ) -> tuple[float | None, float | None, int | None, int | None, int | None]:
         """
         Execute the optimized SQL inside a transaction that is always
         rolled back so no data is modified (DML/DDL safety).
 
-        The query is wrapped as::
-
-            BEGIN;
-            <optimized_sql>;
-            ROLLBACK;
-
-        Execution time is captured with `time.perf_counter()`.  Credit
-        consumption is derived from the configured warehouse size using
-        the standard Snowflake credits-per-hour table.
-
         Returns:
-            (execution_time_sec, credits_used) on success, or
-            (None, None) on any connection / execution failure — the
-            caller falls back to the heuristic metrics in that case.
+            (execution_time_sec, credits_used, bytes_scanned, partitions_scanned, partitions_total) on success, or
+            (None, None, None, None, None) on any connection / execution failure.
         """
         from src.connectors.snowflake_manager import get_connection_manager
 
@@ -382,29 +400,71 @@ class ValidationAgent(BaseAgent):
             manager.execute_query("BEGIN")
 
             start = time.perf_counter()
+            sfqid = None
             try:
-                manager.execute_query(optimized_sql, fetch_results=False)
+                _, sfqid = manager.execute_query(
+                    optimized_sql, fetch_results=False, return_sfqid=True
+                )
             finally:
                 # Always roll back — even if the query raised an exception.
-                elapsed = time.perf_counter() - start
+                elapsed_wall = time.perf_counter() - start
                 manager.execute_query("ROLLBACK")
                 try:
                     manager.execute_query("ALTER SESSION SET USE_CACHED_RESULT = TRUE")
                 except Exception:
                     pass
 
-            # Credits = (seconds / 3600) × credits_per_hour
-            credits_used = (elapsed / 3600.0) * credits_per_hour
+            # ── Retrieve Exact Telemetry from Session History ───────────────
+            compute_time_sec = elapsed_wall  # Fallback
+            credits_used = (elapsed_wall / 3600.0) * credits_per_hour
+            real_bytes = None
+            real_parts_scanned = None
+            real_parts_total = None
+
+            if sfqid:
+                try:
+                    for _ in range(6):  # Retry up to 3 seconds for metadata to flush
+                        history = manager.execute_query(
+                            f"""
+                            SELECT EXECUTION_TIME, BYTES_SCANNED
+                            FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION())
+                            WHERE QUERY_ID = '{sfqid}'
+                            """
+                        )
+                        if history:
+                            row = history[0]
+                            if row.get("EXECUTION_TIME") is not None:
+                                # EXECUTION_TIME is in milliseconds and represents pure compute
+                                compute_time_sec = row["EXECUTION_TIME"] / 1000.0
+                                credits_used = (compute_time_sec / 3600.0) * credits_per_hour
+                            real_bytes = row.get("BYTES_SCANNED")
+                            real_parts_scanned = None
+                            real_parts_total = None
+                            
+                            # If BYTES_SCANNED is still None, it might still be flushing metadata, continue waiting
+                            if real_bytes is None:
+                                time.sleep(0.5)
+                                continue
+                                
+                            logger.info(
+                                "Exact Snowflake telemetry retrieved for query %s: "
+                                "compute_time=%.3fs vs wall_time=%.3fs",
+                                sfqid, compute_time_sec, elapsed_wall
+                            )
+                            break
+                        time.sleep(0.5)
+                except Exception as e:
+                    logger.warning("Failed to retrieve query history for %s: %s", sfqid, e)
 
             logger.info(
-                "Optimized query executed in %.3fs (warehouse=%s, rate=%.0f cr/h, "
-                "credits=%.6f).",
-                elapsed,
+                "Optimized query executed (warehouse=%s, rate=%.0f cr/h, "
+                "compute=%.3fs, credits=%.6f).",
                 warehouse_size,
                 credits_per_hour,
+                compute_time_sec,
                 credits_used,
             )
-            return elapsed, credits_used
+            return compute_time_sec, credits_used, real_bytes, real_parts_scanned, real_parts_total
 
         except Exception as exc:
             logger.warning(
@@ -412,57 +472,58 @@ class ValidationAgent(BaseAgent):
                 "falling back to heuristic metrics. Error: %s",
                 exc,
             )
-            return None, None
+            return None, None, None, None, None
 
     # ── LLM semantic check ────────────────────────────────────────────────────
 
     def _llm_semantic_check(
         self, original_sql: str, optimized_sql: str
-    ) -> tuple[bool, float, list[str], bool]:
+    ) -> tuple[bool, float, list[str], str, bool]:
         """
-        Ask Nova Lite if the two queries are semantically equivalent.
+        Ask the LLM if the two queries are semantically equivalent.
+
+        Uses ChatBedrock with structured output (SemanticCheckResult)
+        for schema-validated responses.
 
         Returns:
-            (is_equivalent, confidence, concerns, llm_was_used)
+            (is_equivalent, confidence, concerns, reasoning, llm_was_used)
         """
-        from src.connectors.bedrock_manager import get_bedrock_manager
-        from src.prompts.optimization_prompt import build_screener_prompt
-
-        bedrock = get_bedrock_manager()
-        prompt = build_screener_prompt(original_sql, optimized_sql)
+        from src.connectors.bedrock_manager import get_screener_llm
+        from src.models.llm_outputs import SemanticCheckResult
+        from src.prompts.optimization_prompt import SCREENER_PROMPT
 
         try:
-            result = bedrock.invoke_json(
-                prompt=prompt,
-                system_prompt=(
-                    "You are a SQL semantic analysis assistant. "
-                    "Be concise and respond only with JSON."
-                ),
-                model_id=self._settings.bedrock_screener_model_id,
-                max_tokens=512,
-            )
-            equivalent = bool(result.get("semantically_equivalent", True))
-            confidence = float(result.get("confidence", 0.8))
-            concerns = result.get("concerns", [])
-            if not equivalent:
+            llm = get_screener_llm().with_structured_output(SemanticCheckResult)
+            result: SemanticCheckResult = (SCREENER_PROMPT | llm).invoke({
+                "original_sql": original_sql.strip(),
+                "optimized_sql": optimized_sql.strip(),
+            })
+
+            if not result.semantically_equivalent:
                 console.print(
                     f"    ⚠️  LLM semantic check: [red]NOT equivalent[/] "
-                    f"(confidence={confidence:.0%})"
+                    f"(confidence={result.confidence:.0%})"
                 )
-                for c in concerns:
+                for c in result.concerns:
                     console.print(f"       → {c}")
             else:
                 console.print(
                     f"    ✅ LLM semantic check: [green]equivalent[/] "
-                    f"(confidence={confidence:.0%})"
+                    f"(confidence={result.confidence:.0%})"
                 )
-            return equivalent, confidence, concerns, True
+            return (
+                result.semantically_equivalent,
+                result.confidence,
+                result.concerns,
+                result.reasoning,
+                True,
+            )
         except Exception as e:
             logger.warning("LLM semantic check failed (non-fatal): %s", e)
             console.print(
                 f"    ⚠️  [yellow]LLM screener failed ({e}) — assuming equivalent[/]"
             )
-            return True, 0.75, [], False
+            return True, 0.0, [], "", False
 
     # ── Decision logic ────────────────────────────────────────────────────────
 
@@ -471,75 +532,47 @@ class ValidationAgent(BaseAgent):
         safety_report: Any,
         semantic_equivalent: bool,
         llm_confidence: float,
+        perf_diff: Any = None,
     ) -> str:
         """
         Map check results to APPROVED / REVIEW / REJECTED.
 
-        REJECTED  → any CRITICAL safety failure
-        REVIEW    → LLM says NOT equivalent with ≥85% confidence
-        APPROVED  → all clear
+        Decision factors (in priority order):
+          1. CRITICAL safety failures → REJECTED
+          2. Significant performance regression → REJECTED
+          3. Minor performance regression → REVIEW
+          4. Semantic non-equivalence with high confidence → REVIEW
+          5. All checks pass and no regression → APPROVED
         """
+        threshold = self._settings.validation_confidence_threshold
+
+        # ── Safety failures are always fatal ──────────────────────
         if safety_report.critical_failures:
             return "REJECTED"
-        if not semantic_equivalent and llm_confidence >= 0.85:
+
+        # ── Performance regression detection ──────────────────────
+        if perf_diff is not None:
+            time_pct = getattr(perf_diff, "execution_time_improvement_pct", 0.0)
+            credits_pct = getattr(perf_diff, "credits_improvement_pct", 0.0)
+
+            # Significant regression: execution time or credits got >5% worse
+            if time_pct < -5.0 or credits_pct < -5.0:
+                console.print(
+                    f"  ❌ [red]PERFORMANCE REGRESSION detected — "
+                    f"time: {time_pct:+.1f}%, credits: {credits_pct:+.1f}%[/]"
+                )
+                return "REJECTED"
+
+            # Minor regression: any negative improvement
+            if time_pct < 0.0 or credits_pct < 0.0:
+                console.print(
+                    f"  ⚠️  [yellow]Minor performance regression — "
+                    f"time: {time_pct:+.1f}%, credits: {credits_pct:+.1f}%[/]"
+                )
+                return "REVIEW"
+
+        # ── Semantic equivalence ──────────────────────────────────
+        if not semantic_equivalent and llm_confidence >= threshold:
             return "REVIEW"
+
         return "APPROVED"
-
-    # ── Metrics builder ───────────────────────────────────────────────────────
-
-    def _build_metrics(
-        self,
-        input_data: dict[str, Any],
-        optimization: dict[str, Any],
-        diff: Any,
-    ) -> dict[str, Any]:
-        """
-        Build the performance metrics dict for the report.
-
-        Uses EXPLAIN diff values when available, otherwise falls back
-        to input_data-based calculation (same as MVP).
-        """
-        change_count = optimization.get("change_count", 0)
-        original_time = input_data.get("execution_time_seconds", 120.0)
-        original_credits = input_data.get("credits_used", 4.5)
-        improvement_factor = max(0.15, 1 - (change_count * 0.22))
-
-        optimized_time = round(original_time * improvement_factor, 1)
-        optimized_credits = round(original_credits * improvement_factor, 2)
-
-        # Use EXPLAIN diff bytes if available, otherwise mock
-        if diff.metrics.bytes_scanned_before > 0:
-            before_gb = round(diff.metrics.bytes_scanned_before / 1e9, 1)
-            after_gb = round(diff.metrics.bytes_scanned_after / 1e9, 1)
-            bytes_pct = round(diff.metrics.bytes_scanned_reduction_pct, 1)
-        else:
-            original_bytes = 480_000_000_000
-            optimized_bytes = int(original_bytes * improvement_factor)
-            before_gb = round(original_bytes / 1e9, 1)
-            after_gb = round(optimized_bytes / 1e9, 1)
-            bytes_pct = round((1 - optimized_bytes / original_bytes) * 100, 1)
-
-        original_pruning = 3
-        optimized_pruning = min(91, 3 + change_count * 28)
-
-        return {
-            "execution_time": {
-                "before_sec": original_time,
-                "after_sec": optimized_time,
-                "improvement_pct": round((1 - optimized_time / original_time) * 100, 1),
-            },
-            "credits": {
-                "before": original_credits,
-                "after": optimized_credits,
-                "improvement_pct": round((1 - optimized_credits / original_credits) * 100, 1),
-            },
-            "bytes_scanned": {
-                "before_gb": before_gb,
-                "after_gb": after_gb,
-                "improvement_pct": bytes_pct,
-            },
-            "partition_pruning": {
-                "before_pct": original_pruning,
-                "after_pct": optimized_pruning,
-            },
-        }

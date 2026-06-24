@@ -1,22 +1,25 @@
 """
-Optimization Agent — LLM-powered SQL rewriting using Amazon Nova Pro.
+Optimization Agent — LLM-powered SQL rewriting using ChatBedrock.
 
-Replaces the MVP's deterministic regex rules with a full LLM pipeline:
+All optimization is performed by the LLM. There are NO hardcoded regex
+rewrite rules — this was the core feedback from Barandeep Singh:
+"The model must determine the necessary steps based on guidelines
+and examples, not hard-coded Python scripts."
 
+Pipeline:
   1. Retrieve similar past cases from Bedrock Knowledge Base (RAG)
   2. Build structured prompt with bottleneck context + RAG examples
-  3. Invoke Amazon Nova Pro to generate optimized SQL + change log
-  4. Parse and validate the structured JSON response
-  5. Fall back to rule-based rewrites if LLM is unavailable
+  3. Invoke ChatBedrock with structured output (OptimizationResult)
+  4. Return validated, schema-guaranteed result
 
-The agent is fully backward-compatible: when Bedrock is not configured
-(BEDROCK_ENABLED=false), it runs the original deterministic fallback.
+When Bedrock is not configured, the agent emits a no-change result
+with a clear recommendation for manual review — it does NOT fall back
+to regex substitution rules.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
 from src.agents.base import BaseAgent, console
@@ -25,28 +28,6 @@ from src.models.messages import AgentRole
 from src.models.state import QueryOptimizationState
 
 logger = logging.getLogger(__name__)
-
-# ── Deterministic fallback rules (MVP behaviour) ─────────────────────────────
-_FALLBACK_RULES: dict[str, dict[str, str]] = {
-    "FULL_COLUMN_SCAN": {
-        "action": "Replace SELECT * with explicit column list",
-        "pattern": r"SELECT\s+\*",
-        "replacement": (
-            "SELECT\n"
-            "    o.order_id,\n"
-            "    o.order_date,\n"
-            "    o.order_amount,\n"
-            "    c.customer_id,\n"
-            "    c.customer_name,\n"
-            "    c.country"
-        ),
-    },
-    "NON_SARGABLE_PREDICATE": {
-        "action": "Replace YEAR(col) with sargable date range predicate",
-        "pattern": r"YEAR\s*\(\s*o\.order_date\s*\)\s*=\s*1995",
-        "replacement": "o.order_date BETWEEN '1995-01-01' AND '1995-12-31'",
-    },
-}
 
 
 class OptimizationAgent(BaseAgent):
@@ -65,11 +46,11 @@ class OptimizationAgent(BaseAgent):
             return self._llm_optimize(original_sql, analysis, state)
         else:
             console.print(
-                "  ⚠️  [yellow]Bedrock not configured — using rule-based fallback[/]"
+                "  ⚠️  [yellow]Bedrock not configured — optimization unavailable[/]"
             )
-            return self._rule_based_optimize(original_sql, analysis)
+            return self._no_change_fallback(original_sql, analysis)
 
-    # ── LLM-powered path ─────────────────────────────────────────────────────
+    # ── LLM-powered optimization ─────────────────────────────────────────────
 
     def _llm_optimize(
         self,
@@ -78,29 +59,30 @@ class OptimizationAgent(BaseAgent):
         state: QueryOptimizationState,
     ) -> dict[str, Any]:
         """
-        Call Nova Pro via RAG-augmented prompt to generate optimized SQL.
+        Call ChatBedrock via RAG-augmented prompt to generate optimized SQL.
 
-        Steps:
-          1. Retrieve similar past cases from Bedrock Knowledge Base
-          2. Build structured prompt
-          3. Invoke Nova Pro
-          4. Parse JSON response
-          5. Return optimized result
+        Uses LangChain's structured output to guarantee schema-validated
+        responses — no manual JSON parsing needed.
         """
-        from src.connectors.bedrock_manager import get_bedrock_manager
-        from src.connectors.rag_manager import get_rag_manager
-        from src.prompts.optimization_prompt import build_optimization_prompt, SYSTEM_PROMPT
-
-        bedrock = get_bedrock_manager()
-        rag = get_rag_manager()
+        from src.connectors.bedrock_manager import get_llm
+        from src.connectors.rag_manager import (
+            retrieve_similar_cases,
+            format_as_few_shot_context,
+        )
+        from src.models.llm_outputs import OptimizationResult
+        from src.prompts.optimization_prompt import (
+            OPTIMIZATION_PROMPT,
+            format_bottleneck_section,
+            format_snowflake_context,
+        )
 
         # ── Step 1: RAG retrieval ────────────────────────────────
         bottleneck_types = [b.get("type", "") for b in analysis.get("bottlenecks", [])]
-        raw_cases = rag.retrieve_similar_cases(
+        raw_cases = retrieve_similar_cases(
             bottleneck_types=bottleneck_types,
             sql_fragment=original_sql[:200],
         )
-        rag_context = rag.format_as_few_shot_context(raw_cases)
+        rag_context = format_as_few_shot_context(raw_cases)
         rag_cases_used = len(raw_cases)
 
         if rag_cases_used:
@@ -110,47 +92,72 @@ class OptimizationAgent(BaseAgent):
         else:
             console.print("  🔍 RAG: no similar cases found (cold start)")
 
-        # ── Step 2: Build prompt ─────────────────────────────────
-        prompt = build_optimization_prompt(
-            original_sql=original_sql,
-            bottlenecks=analysis.get("bottlenecks", []),
-            snowflake_context=analysis.get("snowflake_metadata"),
-            rag_context=rag_context,
-        )
+        # ── Step 2: Build prompt inputs ──────────────────────────
+        prompt_inputs = {
+            "original_sql": original_sql.strip(),
+            "bottleneck_section": format_bottleneck_section(
+                analysis.get("bottlenecks", [])
+            ),
+            "snowflake_context": format_snowflake_context(
+                analysis.get("snowflake_metadata")
+            ),
+            "rag_context": rag_context.strip() if rag_context else "",
+        }
 
-        # ── Step 3: Invoke Nova Pro ──────────────────────────────
+        # ── Step 3: Invoke ChatBedrock with structured output ────
         console.print(
             f"  🤖 Invoking [bold cyan]{self._settings.bedrock_model_id}[/] "
             f"for SQL optimization..."
         )
         try:
-            llm_result = bedrock.invoke_json(
-                prompt=prompt,
-                system_prompt=SYSTEM_PROMPT,
+            llm = get_llm().with_structured_output(OptimizationResult)
+            result: OptimizationResult = (OPTIMIZATION_PROMPT | llm).invoke(prompt_inputs)
+        except Exception as e:
+            console.print(
+                f"  ⚠️  [yellow]LLM call failed ({e}) — returning no-change result[/]"
             )
-        except (RuntimeError, ValueError) as e:
-            console.print(f"  ⚠️  [yellow]LLM call failed ({e}) — falling back to rule-based[/]")
-            return self._rule_based_optimize(original_sql, analysis)
+            return self._no_change_fallback(original_sql, analysis)
 
-        # ── Step 4: Parse response ───────────────────────────────
-        optimized_sql = llm_result.get("optimized_sql", original_sql).strip()
-        changes_applied = llm_result.get("changes_applied", [])
-        rationale = llm_result.get("rationale", "")
-        confidence = float(llm_result.get("confidence", 0.0))
-        warnings = llm_result.get("warnings", [])
+        # ── Step 4: Process result ───────────────────────────────
+        optimized_sql = result.optimized_sql.strip()
+        changes_applied = [c.model_dump() for c in result.changes_applied]
 
         if not optimized_sql or optimized_sql == original_sql:
             console.print("  ℹ️  LLM returned unchanged SQL — no improvements found")
 
-        # ── Step 5: Pretty-print ─────────────────────────────────
+        # ── Step 4½: Verify claimed changes against actual diff ──
+        from src.engines.change_verifier import ChangeVerifier
+
+        verifier = ChangeVerifier()
+        verification = verifier.verify(
+            original_sql=original_sql,
+            optimized_sql=optimized_sql,
+            changes_applied=changes_applied,
+        )
+
+        if verification.total_removed > 0:
+            console.print(
+                f"  🔍 Change verification: [yellow]{verification.total_removed}[/] "
+                f"hallucinated change(s) removed out of {verification.total_claimed}"
+            )
+            for removed in verification.removed_changes:
+                console.print(
+                    f"    ✂️  [dim]Removed:[/] {removed.original_action} "
+                    f"— [yellow]{removed.reason}[/]"
+                )
+
+        # Use only verified changes going forward
+        changes_applied = verification.verified_changes
+
+        # ── Pretty-print ─────────────────────────────────────────
         console.print(
-            f"  ✅ LLM optimization complete — [bold]{len(changes_applied)}[/] change(s)"
-            f", confidence: [bold green]{confidence:.0%}[/]"
+            f"  ✅ LLM optimization complete — [bold]{len(changes_applied)}[/] verified change(s)"
+            f", confidence: [bold green]{result.confidence:.0%}[/]"
         )
         for c in changes_applied:
             console.print(f"    ↳ [{c.get('type', '?')}] {c.get('action', '')}")
-        if warnings:
-            for w in warnings:
+        if result.warnings:
+            for w in result.warnings:
                 console.print(f"    ⚠️  [yellow]{w}[/]")
         console.print(f"\n  [dim]Optimized SQL:[/]\n  [green]{optimized_sql}[/]\n")
 
@@ -160,14 +167,13 @@ class OptimizationAgent(BaseAgent):
             "optimized_sql": optimized_sql,
             "changes_applied": changes_applied,
             "change_count": len(changes_applied),
-            "rationale": rationale,
-            "confidence": confidence,
-            "warnings": warnings,
+            "rationale": result.rationale,
+            "confidence": result.confidence,
+            "warnings": result.warnings,
             "optimization_mode": "llm",
             "llm_model": self._settings.bedrock_model_id,
             "rag_cases_used": rag_cases_used,
-            "rag_results": raw_cases,           # Sprint 2: persist for HTML Section 5
-            "estimated_improvement_pct": min(len(changes_applied) * 25, 85),
+            "rag_results": raw_cases,
         }
 
         return {
@@ -176,98 +182,56 @@ class OptimizationAgent(BaseAgent):
             "next_agent": AgentRole.VALIDATION.value,
             "task_desc": (
                 f"Validate LLM-optimized query — {len(changes_applied)} changes, "
-                f"confidence {confidence:.0%}"
+                f"confidence {result.confidence:.0%}"
             ),
-            # Sprint 2: surface raw RAG results at the top-level state
             "extra_state": {"rag_results": raw_cases},
         }
 
-    # ── Rule-based fallback ───────────────────────────────────────────────────
+    # ── No-change fallback (Bedrock unavailable) ─────────────────────────────
 
-    def _rule_based_optimize(
+    def _no_change_fallback(
         self, original_sql: str, analysis: dict[str, Any]
     ) -> dict[str, Any]:
         """
-        Original MVP deterministic rewrite rules.
+        Emit a no-change result when the LLM is unavailable.
 
-        Used when Bedrock is not configured or the LLM call fails.
+        Instead of silently applying regex rewrite rules, this clearly
+        reports that optimization could not be performed and recommends
+        manual review — matching Barandeep's described fallback procedure:
+        "Provide a recommendation, add comments, and tag the responsible party."
         """
-        optimized_sql = original_sql
-        changes_applied: list[dict[str, str]] = []
-        is_real_tpch = "o_orderdate" in original_sql.lower() or "customer" in original_sql.lower()
-
-        for bottleneck in analysis["bottlenecks"]:
-            rule = _FALLBACK_RULES.get(bottleneck["type"])
-            if rule:
-                pattern = rule["pattern"]
-                replacement = rule["replacement"]
-
-                # Adjust for real TPCH schema if detected
-                if is_real_tpch:
-                    if bottleneck["type"] == "FULL_COLUMN_SCAN":
-                        replacement = (
-                            "SELECT\n"
-                            "    o.o_orderkey,\n"
-                            "    o.o_orderdate,\n"
-                            "    o.o_totalprice,\n"
-                            "    c.c_custkey,\n"
-                            "    c.c_name"
-                        )
-                    elif bottleneck["type"] == "NON_SARGABLE_PREDICATE":
-                        pattern = r"YEAR\s*\(\s*o\.o_orderdate\s*\)\s*=\s*1995"
-                        replacement = "o.o_orderdate BETWEEN '1995-01-01' AND '1995-12-31'"
-
-                new_sql = re.sub(
-                    pattern,
-                    replacement,
-                    optimized_sql,
-                    flags=re.IGNORECASE,
-                )
-                if new_sql != optimized_sql:
-                    changes_applied.append({
-                        "bottleneck_id": bottleneck["id"],
-                        "type": bottleneck["type"],
-                        "action": rule["action"],
-                        "reason": f"Resolves {bottleneck['type']} bottleneck",
-                    })
-                    optimized_sql = new_sql
-
-        # LIMIT guard for spill
-        if any(b["type"] == "REMOTE_SPILL" for b in analysis["bottlenecks"]):
-            if not re.search(r"LIMIT\s+\d+", optimized_sql, re.IGNORECASE):
-                optimized_sql = optimized_sql.rstrip(";") + "\nLIMIT 10000;"
-                changes_applied.append({
-                    "bottleneck_id": "B003",
-                    "type": "REMOTE_SPILL",
-                    "action": "Added LIMIT 10000 to bound result set and reduce spill",
-                    "reason": "Unbounded query causes remote disk spill",
-                })
-
-        console.print(f"  ✏️  Rule-based changes: [bold]{len(changes_applied)}[/]")
-        for c in changes_applied:
-            console.print(f"    ↳ [{c['bottleneck_id']}] {c['action']}")
-        console.print(f"\n  [dim]Optimized SQL:[/]\n  [green]{optimized_sql}[/]\n")
+        console.print(
+            "  📋 [yellow]No optimization performed — manual review recommended[/]"
+        )
+        console.print(
+            "    → Tag the query owner for manual optimization review."
+        )
 
         optimization_output = {
             "query_id": analysis["query_id"],
             "original_sql": original_sql,
-            "optimized_sql": optimized_sql,
-            "changes_applied": changes_applied,
-            "change_count": len(changes_applied),
-            "rationale": "Rule-based optimization applied (LLM not configured)",
-            "confidence": 0.7,
-            "warnings": [],
-            "optimization_mode": "rule_based",
+            "optimized_sql": original_sql,  # unchanged
+            "changes_applied": [],
+            "change_count": 0,
+            "rationale": (
+                "Automated optimization unavailable — Bedrock LLM is not configured. "
+                "Manual review recommended. Please tag the responsible engineer."
+            ),
+            "confidence": 0.0,
+            "warnings": [
+                "No optimization was applied — LLM service is unavailable.",
+                "This query should be reviewed manually by the responsible engineer.",
+            ],
+            "optimization_mode": "unavailable",
             "llm_model": "",
             "rag_cases_used": 0,
-            "rag_results": [],                  # Sprint 2: empty — no RAG in fallback
-            "estimated_improvement_pct": min(len(changes_applied) * 25, 85),
+            "rag_results": [],
         }
 
         return {
             "state_key": "optimization",
             "output": optimization_output,
             "next_agent": AgentRole.VALIDATION.value,
-            "task_desc": f"Validate rule-based optimized query — {len(changes_applied)} changes applied",
-            "extra_state": {"rag_results": []},  # Sprint 2
+            "task_desc": "Validate query — no automated optimization performed (manual review needed)",
+            "extra_state": {"rag_results": []},
         }

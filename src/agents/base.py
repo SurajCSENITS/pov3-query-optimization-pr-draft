@@ -6,6 +6,11 @@ Provides:
 - AgentMessage creation helper
 - State update helper
 - A standard `run()` contract for subclasses
+- Automatic LangSmith tracing via @traceable decorator
+
+When LANGSMITH_API_KEY is set, every agent run is automatically
+traced — providing visibility into agent reasoning, chain-of-thought,
+and confidence scores. When not set, @traceable is a transparent no-op.
 """
 
 from __future__ import annotations
@@ -23,13 +28,36 @@ from src.models.state import QueryOptimizationState
 console = Console()
 
 
+def _get_traceable_decorator():
+    """
+    Return the @traceable decorator from langsmith if available.
+
+    Falls back to a transparent no-op decorator if langsmith
+    is not installed or not configured (no LANGSMITH_API_KEY).
+    """
+    try:
+        from langsmith import traceable
+        return traceable
+    except ImportError:
+        # langsmith not installed — return identity decorator
+        def identity(func=None, **kwargs):
+            if func is not None:
+                return func
+            return lambda f: f
+        return identity
+
+
+traceable = _get_traceable_decorator()
+
+
 class BaseAgent(abc.ABC):
     """
     Abstract base for every agent in the pipeline.
 
     Subclasses implement `process()` with their domain logic.
     The `run()` method handles message construction, logging,
-    and state updates — keeping agent code focused on logic.
+    state updates, and LangSmith tracing — keeping agent code
+    focused on logic.
     """
 
     name: str = "BaseAgent"
@@ -37,6 +65,7 @@ class BaseAgent(abc.ABC):
 
     # ── Public entry point (called by LangGraph node) ───────────
 
+    @traceable(run_type="chain")
     def run(self, state: QueryOptimizationState) -> dict[str, Any]:
         """
         Execute the agent:
@@ -44,6 +73,9 @@ class BaseAgent(abc.ABC):
         2. Delegate to `process()` for domain logic
         3. Build outgoing AgentMessage
         4. Return state patch (LangGraph merges this automatically)
+
+        Automatically traced by LangSmith when configured,
+        capturing input state, output state, and timing.
         """
         self._log_entry(state)
 

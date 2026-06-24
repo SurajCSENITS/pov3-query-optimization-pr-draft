@@ -8,6 +8,7 @@ pipeline state and consumed by the HTML Report Generator (Section 6).
 
 from __future__ import annotations
 
+from typing import Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -63,5 +64,5 @@ class ValidationEvidence(BaseModel):
 
     # ── Aggregate ──────────────────────────────────────────────────
     overall_decision: str = "UNKNOWN"   # APPROVED | REVIEW | REJECTED
-    confidence_score: float = 0.0
+    confidence_score: Optional[float] = None  # None when LLM not used
     evidence_bundle_id: str = Field(default_factory=lambda: str(uuid4())[:12])

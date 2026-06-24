@@ -228,7 +228,7 @@ class ExplainPlanDiffEngine:
         m = DiffMetrics()
 
         def extract_int(text: str, key: str) -> int:
-            pattern = rf"{key}\s*[=:]\s*(\d+)"
+            pattern = rf'["\']?{key}["\']?\s*[=:]\s*(\d+)'
             match = re.search(pattern, text, re.IGNORECASE)
             return int(match.group(1)) if match else 0
 
@@ -255,11 +255,11 @@ class ExplainPlanDiffEngine:
                 / m.bytes_scanned_before * 100
             )
 
-        if m.partitions_before > 0 and m.partitions_after < m.partitions_before:
-            m.partition_pruning_improvement_pct = (
-                (m.partitions_before - m.partitions_after)
-                / m.partitions_before * 100
-            )
+        if m.partitions_total_before > 0 and m.partitions_total_after > 0:
+            pruning_before = (m.partitions_total_before - m.partitions_before) / m.partitions_total_before * 100
+            pruning_after = (m.partitions_total_after - m.partitions_after) / m.partitions_total_after * 100
+            if pruning_after > pruning_before:
+                m.partition_pruning_improvement_pct = pruning_after - pruning_before
 
         if m.columns_scanned_before > 0:
             m.columns_scanned_reduction_pct = (
@@ -271,7 +271,7 @@ class ExplainPlanDiffEngine:
 
     def _compute_score(self, diff: ExplainPlanDiff) -> float:
         """
-        Compute an overall improvement score 0.0–1.0.
+        Compute an overall improvement score 0.0-1.0.
 
         Weights:
           - bytes reduction:         30%

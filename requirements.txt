@@ -1,5 +1,8 @@
 langgraph>=0.4.1
 langchain-core>=0.3.0
+langchain-aws>=0.2.0
+langchain-community>=0.2.0
+langsmith>=0.1.0
 pydantic>=2.7.0
 pydantic-settings>=2.3.0
 rich>=13.7.0

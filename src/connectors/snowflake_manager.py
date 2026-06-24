@@ -138,7 +138,8 @@ class SnowflakeConnectionManager:
         sql: str,
         params: dict[str, Any] | None = None,
         fetch_results: bool = True,
-    ) -> list[dict[str, Any]]:
+        return_sfqid: bool = False,
+    ) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], str]:
         """
         Execute a SQL query and return results as a list of dicts.
 
@@ -162,11 +163,14 @@ class SnowflakeConnectionManager:
                 conn = self._get_connection()
                 cursor = conn.cursor(DictCursor)
                 cursor.execute(sql, params or {})
+                sfqid = getattr(cursor, "sfqid", "")
                 if fetch_results:
                     results = cursor.fetchall()
                 else:
                     results = []
                 cursor.close()
+                if return_sfqid:
+                    return results, sfqid
                 return results
 
             except (OperationalError, InterfaceError) as e:
