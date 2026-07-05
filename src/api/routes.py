@@ -16,15 +16,12 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 
 from src.config.settings import get_settings
-from src.graph.workflow import build_workflow
 from src.models.messages import AgentMessage, AgentRole
+from src.services.pipeline import run_optimization_pipeline
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# ── Build the workflow once (reused across requests) ────────────
-_workflow = build_workflow()
 
 
 # ── Request / Response models ───────────────────────────────────
@@ -67,44 +64,6 @@ class HealthResponse(BaseModel):
     timestamp: str
     snowflake_connected: bool
     snowflake_enabled: bool
-
-
-# ── Helper: run pipeline ───────────────────────────────────────
-
-def _run_pipeline(message: AgentMessage) -> dict[str, Any]:
-    """
-    Construct initial state from the incoming A2A message
-    and invoke the LangGraph workflow.
-
-    Returns the final state dict.
-    """
-    initial_state = {
-        "input_data": message.payload,
-        "analysis": {},
-        "optimization": {},
-        "validation": {},
-        "report": {},
-        "pr": {},
-        "rag_results": [],           # Sprint 2
-        "validation_evidence": {},   # Sprint 2
-        "messages": [message.model_dump()],
-    }
-
-    logger.info(
-        "Starting pipeline for query_id=%s (message_id=%s)",
-        message.payload.get("query_id"),
-        message.message_id,
-    )
-
-    final_state = _workflow.invoke(initial_state)
-
-    logger.info(
-        "Pipeline complete for query_id=%s — validation=%s",
-        message.payload.get("query_id"),
-        final_state.get("validation", {}).get("semantic_check", "N/A"),
-    )
-
-    return final_state
 
 
 # ── Routes ──────────────────────────────────────────────────────
@@ -152,7 +111,7 @@ async def ingest_alert(message: AgentMessage) -> PipelineResultResponse:
 
     # Run the pipeline
     try:
-        final_state = _run_pipeline(message)
+        final_state = run_optimization_pipeline(message)
     except Exception as e:
         logger.exception("Pipeline failed for message_id=%s", message.message_id)
         raise HTTPException(

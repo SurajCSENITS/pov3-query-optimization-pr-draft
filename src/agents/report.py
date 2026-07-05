@@ -79,8 +79,8 @@ class ReportAgent(BaseAgent):
 
         performance_table = {
             "execution_time": (
-                f"{metrics['execution_time']['before_sec']}s → "
-                f"{metrics['execution_time']['after_sec']}s "
+                f"{metrics['execution_time']['before_ms']}ms → "
+                f"{metrics['execution_time']['after_ms']}ms "
                 f"({_fmt_metric(time_pct)})"
             ),
             "credits_consumed": (
@@ -89,8 +89,8 @@ class ReportAgent(BaseAgent):
                 f"({_fmt_metric(credits_pct)})"
             ),
             "bytes_scanned": (
-                f"{metrics['bytes_scanned']['before_gb']} GB → "
-                f"{metrics['bytes_scanned']['after_gb']} GB "
+                f"{metrics['bytes_scanned']['before_mb']} MB → "
+                f"{metrics['bytes_scanned']['after_mb']} MB "
                 f"({_fmt_metric(bytes_pct)})"
             ),
             "partition_pruning": (

@@ -21,16 +21,16 @@ from pydantic import BaseModel, Field
 
 class PerformanceMetrics(BaseModel):
     """Before/after performance metrics for a single optimization."""
-    execution_time_before_sec: float = 0.0
-    execution_time_after_sec: float = 0.0
+    execution_time_before_ms: float = 0.0
+    execution_time_after_ms: float = 0.0
     execution_time_improvement_pct: float = 0.0
 
     credits_before: float = 0.0
     credits_after: float = 0.0
     credits_improvement_pct: float = 0.0
 
-    bytes_scanned_before_gb: float = 0.0
-    bytes_scanned_after_gb: float = 0.0
+    bytes_scanned_before_mb: float = 0.0
+    bytes_scanned_after_mb: float = 0.0
     bytes_scanned_improvement_pct: float = 0.0
 
     partition_pruning_before_pct: float = 0.0
@@ -42,9 +42,9 @@ class PerformanceMetrics(BaseModel):
 class PerformanceSnapshot(BaseModel):
     """A point-in-time snapshot of query performance numbers."""
 
-    execution_time_sec: float = 0.0
+    execution_time_ms: float = 0.0
     credits: float = 0.0
-    bytes_scanned_gb: float = 0.0
+    bytes_scanned_mb: float = 0.0
     partition_pruning_pct: float = 0.0
 
 
@@ -165,14 +165,14 @@ class OptimizationReport(BaseModel):
 
         # ── Performance metrics ──────────────────────────────────
         perf = PerformanceMetrics(
-            execution_time_before_sec=metrics_raw.get("execution_time", {}).get("before_sec", 0.0),
-            execution_time_after_sec=metrics_raw.get("execution_time", {}).get("after_sec", 0.0),
+            execution_time_before_ms=metrics_raw.get("execution_time", {}).get("before_ms", 0.0),
+            execution_time_after_ms=metrics_raw.get("execution_time", {}).get("after_ms", 0.0),
             execution_time_improvement_pct=metrics_raw.get("execution_time", {}).get("improvement_pct", 0.0),
             credits_before=metrics_raw.get("credits", {}).get("before", 0.0),
             credits_after=metrics_raw.get("credits", {}).get("after", 0.0),
             credits_improvement_pct=metrics_raw.get("credits", {}).get("improvement_pct", 0.0),
-            bytes_scanned_before_gb=metrics_raw.get("bytes_scanned", {}).get("before_gb", 0.0),
-            bytes_scanned_after_gb=metrics_raw.get("bytes_scanned", {}).get("after_gb", 0.0),
+            bytes_scanned_before_mb=metrics_raw.get("bytes_scanned", {}).get("before_mb", 0.0),
+            bytes_scanned_after_mb=metrics_raw.get("bytes_scanned", {}).get("after_mb", 0.0),
             bytes_scanned_improvement_pct=metrics_raw.get("bytes_scanned", {}).get("improvement_pct", 0.0),
             partition_pruning_before_pct=metrics_raw.get("partition_pruning", {}).get("before_pct", 0.0),
             partition_pruning_after_pct=metrics_raw.get("partition_pruning", {}).get("after_pct", 0.0),

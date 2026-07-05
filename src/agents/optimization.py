@@ -93,6 +93,15 @@ class OptimizationAgent(BaseAgent):
             console.print("  🔍 RAG: no similar cases found (cold start)")
 
         # ── Step 2: Build prompt inputs ──────────────────────────
+        # Inject feedback from previous validation failures if this is a retry
+        feedback_history = state.get("feedback_history", [])
+        feedback_section = ""
+        if feedback_history:
+            feedback_section = "## Validation Feedback\n" + "\n".join(
+                f"- {msg}" for msg in feedback_history
+            )
+            console.print(f"  🔄 Retrying: injecting {len(feedback_history)} previous failure feedback(s)")
+
         prompt_inputs = {
             "original_sql": original_sql.strip(),
             "bottleneck_section": format_bottleneck_section(
@@ -102,6 +111,7 @@ class OptimizationAgent(BaseAgent):
                 analysis.get("snowflake_metadata")
             ),
             "rag_context": rag_context.strip() if rag_context else "",
+            "feedback_section": feedback_section,
         }
 
         # ── Step 3: Invoke ChatBedrock with structured output ────

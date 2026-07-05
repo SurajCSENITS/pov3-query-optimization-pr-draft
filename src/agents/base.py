@@ -37,6 +37,19 @@ def _get_traceable_decorator():
     """
     try:
         from langsmith import traceable
+        from src.config.observability import get_langsmith_client
+        
+        # Get the global client configured with PII anonymizer
+        client = get_langsmith_client()
+        
+        if client:
+            # Wrap traceable to automatically inject our custom client
+            def custom_traceable(*args, **kwargs):
+                if "client" not in kwargs:
+                    kwargs["client"] = client
+                return traceable(*args, **kwargs)
+            return custom_traceable
+            
         return traceable
     except ImportError:
         # langsmith not installed — return identity decorator

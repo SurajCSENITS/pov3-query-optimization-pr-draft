@@ -594,14 +594,14 @@ class HTMLReportGenerator:
 
         cards = (
             gauge("Execution Time",
-                  et.get("before_sec", "N/A"), et.get("after_sec", "N/A"),
-                  "s", et.get("improvement_pct", 0.0))
+                  et.get("before_ms", "N/A"), et.get("after_ms", "N/A"),
+                  "ms", et.get("improvement_pct", 0.0))
             + gauge("Credits Used",
                     self._format_credits(cr.get("before", "N/A")), self._format_credits(cr.get("after", "N/A")),
                     "", cr.get("improvement_pct", 0.0))
             + gauge("Bytes Scanned",
-                    bs.get("before_gb", "N/A"), bs.get("after_gb", "N/A"),
-                    "GB", bs.get("improvement_pct", 0.0))
+                    bs.get("before_mb", "N/A"), bs.get("after_mb", "N/A"),
+                    "MB", bs.get("improvement_pct", 0.0))
             + gauge("Partition Pruning",
                     f'{pp.get("before_pct", 0)}%', f'{pp.get("after_pct", 0)}%',
                     "", pp.get("improvement_pct", 0.0))

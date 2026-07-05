@@ -313,7 +313,7 @@ class ValidationAgent(BaseAgent):
             f"confidence={llm_confidence:.0%})"
         )
 
-        if metrics.get("execution_time", {}).get("before_sec") is not None:
+        if metrics.get("execution_time", {}).get("before_ms") is not None:
             time_pct = metrics['execution_time']['improvement_pct']
             credits_pct = metrics['credits']['improvement_pct']
             bytes_pct = metrics['bytes_scanned']['improvement_pct']
@@ -328,8 +328,8 @@ class ValidationAgent(BaseAgent):
                     return f"[dim]0.0% (no change)[/]"
 
             console.print(
-                f"  ⏱  Execution: {metrics['execution_time']['before_sec']}s → "
-                f"{metrics['execution_time']['after_sec']}s "
+                f"  ⏱  Execution: {metrics['execution_time']['before_ms']}ms → "
+                f"{metrics['execution_time']['after_ms']}ms "
                 f"({_fmt_pct(time_pct)})"
             )
             console.print(
@@ -338,8 +338,8 @@ class ValidationAgent(BaseAgent):
                 f"({_fmt_pct(credits_pct)})"
             )
             console.print(
-                f"  📦 Bytes: {metrics['bytes_scanned']['before_gb']} GB → "
-                f"{metrics['bytes_scanned']['after_gb']} GB "
+                f"  📦 Bytes: {metrics['bytes_scanned']['before_mb']} MB → "
+                f"{metrics['bytes_scanned']['after_mb']} MB "
                 f"({_fmt_pct(bytes_pct)})"
             )
         else:
@@ -347,14 +347,50 @@ class ValidationAgent(BaseAgent):
                 "  ℹ️  Performance metrics: N/A (no real telemetry available)"
             )
 
+        extra_state = {"validation_evidence": evidence.model_dump()}
+        
+        # ── Retry feedback logic ──────────────────────────────────────────────
+        if decision != "APPROVED":
+            current_retry = state.get("retry_count", 0)
+            feedback = (
+                f"Validation attempt {current_retry + 1} failed. "
+                f"Decision: {decision}. "
+            )
+            
+            # Summarize regressions
+            regressions = []
+            if metrics.get('execution_time', {}).get('improvement_pct', 0) < 0:
+                regressions.append(f"Execution time got worse ({_fmt_pct(metrics['execution_time']['improvement_pct'])})")
+                
+            if regressions:
+                feedback += "Performance regressions: " + "; ".join(regressions) + ". "
+                
+            if not semantic_equivalent:
+                feedback += f"Semantic equivalence failed: {llm_reasoning} "
+                
+            if safety_report.critical_failures:
+                feedback += f"Safety failures: {', '.join(safety_report.critical_failures)}. "
+                
+            # Read existing feedback and append
+            history = state.get("feedback_history", [])
+            
+            # Using _merge_lists semantics, but we will just pass a single element list
+            # Wait, TypedDict with Annotated[list, operator.add] or similar?
+            # State definition didn't annotate feedback_history with a reducer!
+            # So we must manually build the full new list.
+            new_history = history + [feedback]
+            
+            extra_state["retry_count"] = current_retry + 1
+            extra_state["feedback_history"] = new_history
+
         return {
             "state_key": "validation",
             "output": validation_output,
-            "next_agent": AgentRole.REPORT.value,
+            "next_agent": AgentRole.REPORT.value if decision == "APPROVED" else AgentRole.OPTIMIZATION.value,
             "task_desc": (
                 f"Generate optimization report — validation {decision}"
             ),
-            "extra_state": {"validation_evidence": evidence.model_dump()},
+            "extra_state": extra_state,
         }
 
     # ── Live Snowflake execution ────────────────────────────────────────────

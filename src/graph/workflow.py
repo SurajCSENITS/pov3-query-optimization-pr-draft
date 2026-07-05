@@ -51,6 +51,21 @@ def pr_node(state: QueryOptimizationState) -> dict:
     return _pr_agent.run(state)
 
 
+def route_after_validation(state: QueryOptimizationState) -> str:
+    """
+    Route to optimization if validation fails and max retries not reached.
+    """
+    validation = state.get("validation", {})
+    decision = validation.get("decision", "APPROVED")
+    
+    if decision != "APPROVED":
+        retry_count = state.get("retry_count", 0)
+        if retry_count < 2:
+            return "optimization"
+            
+    return "report"
+
+
 # ── Graph construction ──────────────────────────────────────────
 
 def build_workflow() -> StateGraph:
@@ -72,7 +87,11 @@ def build_workflow() -> StateGraph:
     graph.set_entry_point("analysis")
     graph.add_edge("analysis", "optimization")
     graph.add_edge("optimization", "validation")
-    graph.add_edge("validation", "report")
+    graph.add_conditional_edges(
+        "validation", 
+        route_after_validation,
+        {"optimization": "optimization", "report": "report"}
+    )
     graph.add_edge("report", "pr")
     graph.add_edge("pr", END)
 

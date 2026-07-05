@@ -157,13 +157,13 @@ class PerformanceComparisonEngine:
                 bytes_pct = (bytes_before - bytes_after) / bytes_before * 100.0
 
         if bytes_before > 0:
-            bytes_before_gb = round(bytes_before / 1e9, 1)
-            bytes_after_gb  = round(bytes_after  / 1e9, 1)
+            bytes_before_mb = round(bytes_before / 1e6, 2)
+            bytes_after_mb  = round(bytes_after  / 1e6, 2)
             bytes_pct       = round(bytes_pct, 1)
         else:
             # No real bytes data — report 0.0 instead of fabricating numbers
-            bytes_before_gb = 0.0
-            bytes_after_gb  = 0.0
+            bytes_before_mb = 0.0
+            bytes_after_mb  = 0.0
             bytes_pct       = 0.0
             logger.info(
                 "PerformanceComparisonEngine: no EXPLAIN bytes data — "
@@ -239,15 +239,15 @@ class PerformanceComparisonEngine:
             )
 
         before = PerformanceSnapshot(
-            execution_time_sec=original_time,
+            execution_time_ms=round(original_time * 1000.0, 1),
             credits=original_credits,
-            bytes_scanned_gb=bytes_before_gb,
+            bytes_scanned_mb=bytes_before_mb,
             partition_pruning_pct=pruning_before,
         )
         after = PerformanceSnapshot(
-            execution_time_sec=optimized_time,
+            execution_time_ms=round(optimized_time * 1000.0, 1),
             credits=optimized_credits,
-            bytes_scanned_gb=bytes_after_gb,
+            bytes_scanned_mb=bytes_after_mb,
             partition_pruning_pct=pruning_after,
         )
 
@@ -270,26 +270,35 @@ class PerformanceComparisonEngine:
         Convert a PerformanceDiff into the legacy metrics dict shape
         expected by ReportAgent, PRAgent, and the rest of the pipeline.
         """
+        def _format_bytes(gb: float) -> str:
+            if gb == 0.0:
+                return "0.0 GB"
+            bytes_val = gb * 1e9
+            if bytes_val >= 1e9: return f"{bytes_val/1e9:.1f} GB"
+            if bytes_val >= 1e6: return f"{bytes_val/1e6:.1f} MB"
+            if bytes_val >= 1e3: return f"{bytes_val/1e3:.1f} KB"
+            return f"{int(bytes_val)} B"
+
         return {
             "execution_time": {
-                "before_sec":       diff.before.execution_time_sec,
-                "after_sec":        diff.after.execution_time_sec,
-                "improvement_pct":  diff.execution_time_improvement_pct,
+                "before_ms": diff.before.execution_time_ms,
+                "after_ms": diff.after.execution_time_ms,
+                "improvement_pct": diff.execution_time_improvement_pct,
             },
             "credits": {
-                "before":           diff.before.credits,
-                "after":            diff.after.credits,
-                "improvement_pct":  diff.credits_improvement_pct,
+                "before": round(diff.before.credits, 4),
+                "after": round(diff.after.credits, 4),
+                "improvement_pct": diff.credits_improvement_pct,
             },
             "bytes_scanned": {
-                "before_gb":        diff.before.bytes_scanned_gb,
-                "after_gb":         diff.after.bytes_scanned_gb,
-                "improvement_pct":  diff.bytes_scanned_improvement_pct,
+                "before_mb": diff.before.bytes_scanned_mb,
+                "after_mb": diff.after.bytes_scanned_mb,
+                "improvement_pct": diff.bytes_scanned_improvement_pct,
             },
             "partition_pruning": {
-                "before_pct":       diff.before.partition_pruning_pct,
-                "after_pct":        diff.after.partition_pruning_pct,
-                "improvement_pct":  diff.pruning_improvement_pct,
+                "before_pct": diff.before.partition_pruning_pct,
+                "after_pct": diff.after.partition_pruning_pct,
+                "improvement_pct": diff.pruning_improvement_pct,
             },
         }
 

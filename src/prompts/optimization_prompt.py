@@ -59,7 +59,10 @@ as a JOIN with GROUP BY, a CTE, or a window function.
 6. Explain every change you make — but ONLY changes you actually make.
 7. Respond ONLY with valid JSON — no markdown, no prose outside the JSON.
 8. If you cannot find any meaningful optimizations, return the original SQL \
-unchanged with an empty changes_applied list. Do NOT invent fake changes."""
+unchanged with an empty changes_applied list. Do NOT invent fake changes.
+9. If you receive "Validation Feedback", it means your previous optimization \
+attempt failed (e.g. it caused a performance regression or safety violation). \
+You MUST fix the issues mentioned in the feedback. Do not repeat the same mistake!"""
 
 
 # ── Optimization prompt template ─────────────────────────────────────────────
@@ -81,6 +84,8 @@ Optimize the following Snowflake SQL query.
 {snowflake_context}
 
 {rag_context}
+
+{feedback_section}
 
 ## Response Format
 Respond with ONLY a JSON object matching this exact schema — no prose:

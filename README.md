@@ -2,7 +2,7 @@
 
 A multi-agent orchestration pipeline using **LangGraph** and **LangChain** that detects slow Snowflake queries, analyzes bottlenecks, optimizes the SQL using LLMs with RAG context, validates the results with safety checks and semantic screening, and generates a Draft Pull Request.
 
-Features explicit **Agent-to-Agent (A2A) messaging**, **shared state management**, a production-ready **FastAPI web server**, **Snowflake metadata integration**, **Amazon Bedrock** integration via LangChain for advanced SQL reasoning, and comprehensive **LangSmith** observability.
+Features explicit **Agent-to-Agent (A2A) messaging**, **shared state management**, a production-ready **FastAPI web server**, **NATS messaging integration** for decoupled inter-project communication, **Snowflake metadata integration**, **Amazon Bedrock** integration via LangChain for advanced SQL reasoning, and comprehensive **LangSmith** observability.
 
 ---
 
@@ -51,35 +51,66 @@ python3 main.py
 ## Architecture & Pipeline
 
 ```text
-                 POV4 Alert (HTTP POST)
-                           │
-                           ▼
-┌────────────────── server.py (FastAPI) ─────────────────────────┐
-│                                                                │
-│                  LangGraph Pipeline                            │
-│                                                                │
-│   AnalysisAgent ──→ OptimizationAgent ──→ ValidationAgent      │
-│         │                  │                      │            │
-│         ▼ (Metadata)       ▼ (ChatBedrock + RAG)  ▼ (Safety)   │
-│     Snowflake DB     AWS Bedrock & S3      SQLSafetyEngine     │
-│                                                   │            │
-│                                                   ▼            │
-│                              PRAgent ◄── ReportAgent           │
-│                                                                │
-│   ┌────────────────────────────────────────────────────────┐   │
-│   │  Shared State (QueryOptimizationState)                 │   │
-│   │  ├─ input_data    ← POV4 payload                       │   │
-│   │  ├─ analysis      ← Bottlenecks & Explain Plans        │   │
-│   │  ├─ optimization  ← Optimized SQL & LLM Confidence     │   │
-│   │  ├─ validation    ← Decision (APPROVED/REVIEW/REJECTED)│   │
-│   │  ├─ report        ← RAG S3 Storage metadata            │   │
-│   │  ├─ pr            ← Draft PR payload                   │   │
-│   │  └─ messages[]    ← All A2A messages                   │   │
-│   └────────────────────────────────────────────────────────┘   │
-└────────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-              Draft PR Payload (JSON/Console)
+                     POV4 Alert (External System)
+                                │
+                                ▼
+                       NATS Subject / Stream
+                      (pov4.alerts.optimization)
+                                │
+          ┌─────────────────────┴──────────────────────┐
+          ▼                                            ▼
+ [ HTTP POST /alerts/ingest ]                 [ NATS Subscriber ]
+          │                                            │
+          └─────────────────────┬──────────────────────┘
+                                ▼
+ ┌───────────────── src/services/pipeline.py ─────────────────────┐
+ │                                                                │
+ │                      LangGraph Agent Flow                      │
+ │                                                                │
+ │                       [ AnalysisAgent ]                        │
+ │                               │                                │
+ │                               ▼                                │
+ │                 ┌──► [ OptimizationAgent ]                     │
+ │                 │             │                                │
+ │      Retry flow │             ▼                                │
+ │    (max 2 times)│      [ ValidationAgent ]                     │
+ │                 │             │                                │
+ │                 └─────── (Rejected)   │ (Approved)             │
+ │                                       ▼                        │
+ │                                [ ReportAgent ]                 │
+ │                                       │                        │
+ │                                       ▼                        │
+ │                                  [ PRAgent ]                   │
+ │                                                                │
+ │   ┌────────────────────────────────────────────────────────┐   │
+ │   │  Shared State (QueryOptimizationState)                 │   │
+ │   │  ├─ input_data       ← POV4 payload                    │   │
+ │   │  ├─ analysis         ← Bottlenecks & Explain Plans     │   │
+ │   │  ├─ optimization     ← Optimized SQL & LLM Confidence  │   │
+ │   │  ├─ validation       ← Decision (APPROVED/REJECTED)    │   │
+ │   │  ├─ retry_count      ← Number of validation retries    │   │
+ │   │  ├─ feedback_history ← Accumulated failure feedback    │   │
+ │   │  ├─ report           ← RAG S3 Storage metadata         │   │
+ │   │  ├─ pr               ← Draft PR payload                │   │
+ │   │  └─ messages[]       ← All A2A messages                │   │
+ │   └────────────────────────────────────────────────────────┘   │
+ └────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+                       Agent Integrations
+ ┌────────────────────────────────────────────────────────────────┐
+ │ • AnalysisAgent     ──► Connects to Snowflake DB (telemetry)   │
+ │ • OptimizationAgent ──► AWS Bedrock LLM + Knowledge Base (RAG) │
+ │ • ValidationAgent   ──► Executes internal validation pipeline: │
+ │                         1. SQLSafetyEngine (Regex/AST checks)  │
+ │                         2. ExplainPlanDiffEngine (Plan compare)│
+ │                         3. Semantic Screener (Bedrock equivalent)│
+ │ • ReportAgent       ──► Generates HTML report & uploads to S3  │
+ │ • PRAgent           ──► Formats and generates the final Draft PR│
+ └────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+                  Draft PR Payload (JSON/Console)
 ```
 
 ---
@@ -88,11 +119,12 @@ python3 main.py
 
 ### 1. Agents
 * **Analysis Agent**: Connects to Snowflake to run `EXPLAIN` and check `QUERY_HISTORY`. Leverages LLM reasoning to identify table scans, spillage, and pruning issues using `ChatBedrock.with_structured_output()`.
-* **Optimization Agent**: Leverages **Amazon Bedrock** via LangChain to rewrite SQL. Uses **LangChain RAG (AmazonKnowledgeBasesRetriever)** to fetch prior successful optimization reports from an S3-backed Bedrock Knowledge Base. Fully schema-validated output via `OptimizationResult`.
+* **Optimization Agent**: Leverages **Amazon Bedrock** via LangChain to rewrite SQL. Uses **LangChain RAG (AmazonKnowledgeBasesRetriever)** to fetch prior successful optimization reports from an S3-backed Bedrock Knowledge Base. Fully schema-validated output via `OptimizationResult`. Incorporates dynamic **Validation Feedback** on retry runs to guide the LLM away from past failures.
 * **Validation Agent**: Uses a robust 3-stage validation process:
   1. **SQL Safety Engine (Regex Layer)**: Deterministic AST-like safety checks (blocks DDL/DML, ensures WHERE/GROUP BY clauses are preserved).
   2. **Explain Plan Diff Engine**: Compares Snowflake EXPLAIN plans before/after optimization, extracting telemetry cleanly.
   3. **Semantic Screener (LLM Layer)**: Uses **ChatBedrock** to check for semantic equivalence and flag potential edge cases via structured output `SemanticCheckResult`. Output is `APPROVED`, `REVIEW`, or `REJECTED`.
+* **Validation Retry Loop**: If validation is not `APPROVED`, the pipeline routes back to the **Optimization Agent** up to 2 times. The failure feedback (performance regression details, safety failures, or semantic mismatch comments) is saved to the state's `feedback_history` and dynamically injected into the optimization prompt.
 * **Report Agent**: Compiles all pipeline metrics into an `OptimizationReport` and uploads it to S3, continuously feeding the Bedrock Knowledge Base.
 * **PR Agent**: Generates the final GitHub Draft Pull Request payload, embedding AI metadata, explain diff insights, and the validation decision.
 
@@ -104,7 +136,7 @@ python3 main.py
 ### 3. Engines
 * `SQLSafetyEngine`: Hybrid deterministic + LLM safety checks.
 * `ExplainPlanDiffEngine`: Extracts metrics and operations from raw Snowflake EXPLAIN plans to calculate performance gains.
-* `PerformanceComparisonEngine`: Compares raw execution telemetry cleanly without artificial heuristics.
+* `PerformanceComparisonEngine`: Compares raw execution telemetry cleanly. Performance metrics are processed in **milliseconds (`ms`)** for execution time and **megabytes (`MB`)** for scanned data to ensure precision.
 
 ---
 
@@ -123,8 +155,13 @@ class AgentMessage(BaseModel):
     payload: dict         # Structured data for the receiver
 ```
 
-### LangSmith Tracing
+### LangSmith Tracing & PII Masking
 All agents inherit from `BaseAgent` and use the `@traceable` decorator on their `run()` loops. When `LANGSMITH_API_KEY` is configured, this provides deep, automatic tracking of token usage, latency, chain-of-thought, and state payloads natively inside the LangSmith platform.
+
+To ensure data security, the tracing pipeline integrates a custom client (via `src/config/observability.py`) equipped with a `RuleNodeProcessor` to automatically mask sensitive PII in trace payloads. It matches and redacts:
+* Email formats (`[EMAIL_REDACTED]`)
+* Credit card formats (`[CC_REDACTED]`)
+* Social Security Numbers (`[SSN_REDACTED]`)
 
 ---
 
@@ -136,6 +173,7 @@ All agents inherit from `BaseAgent` and use the `@traceable` decorator on their 
 | LLM Framework   | LangChain `langchain-aws`        |
 | Observability   | LangSmith `@traceable`           |
 | Web Framework   | FastAPI + Uvicorn                |
+| Messaging       | NATS (`nats-py`)                 |
 | Cloud AI        | AWS Bedrock                      |
 | Storage & RAG   | AWS S3 & Bedrock Knowledge Bases |
 | DB Connection   | `snowflake-connector-python`     |

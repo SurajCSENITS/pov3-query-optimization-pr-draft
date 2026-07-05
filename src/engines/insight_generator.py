@@ -53,11 +53,11 @@ class InsightGenerator:
 
         # ── Bytes scanned reduction ──────────────────────────────
         if m.bytes_scanned_reduction_pct > 5:
-            before_gb = round(m.bytes_scanned_before / 1e9, 1)
-            after_gb = round(m.bytes_scanned_after / 1e9, 1)
-            if before_gb > 0:
+            before_mb = round(m.bytes_scanned_before / 1e6, 2)
+            after_mb = round(m.bytes_scanned_after / 1e6, 2)
+            if before_mb > 0:
                 insights.append(
-                    f"Bytes scanned reduced from {before_gb} GB to {after_gb} GB "
+                    f"Bytes scanned reduced from {before_mb} MB to {after_mb} MB "
                     f"({m.bytes_scanned_reduction_pct:.0f}% reduction in data read)."
                 )
             else:

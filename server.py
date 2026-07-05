@@ -52,7 +52,7 @@ app.include_router(router)
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    """Log configuration on startup."""
+    """Log configuration and start optional services on startup."""
     settings = get_settings()
     logger.info("POV3 server starting...")
     logger.info("Snowflake enabled: %s", settings.snowflake_enabled)
@@ -81,6 +81,41 @@ async def startup_event() -> None:
         logger.info("RAG KB: %s (bucket=%s)", settings.bedrock_kb_id, settings.s3_bucket_name)
     else:
         logger.info("Bedrock not configured — LLM optimization disabled.")
+
+    # ── NATS subscriber (inter-project communication) ───────────
+    if settings.nats_configured:
+        try:
+            from src.communication.subscriber import get_nats_subscriber
+
+            subscriber = get_nats_subscriber()
+            await subscriber.start()
+            logger.info("NATS subscriber started (subject=%s)", settings.nats_subject)
+        except Exception as e:
+            logger.error("Failed to start NATS subscriber: %s", e)
+            logger.info("Continuing in HTTP-only mode.")
+    else:
+        logger.info("NATS disabled — operating in HTTP-only mode.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    """Gracefully stop NATS subscriber and close connection on shutdown."""
+    settings = get_settings()
+
+    if settings.nats_configured:
+        try:
+            from src.communication.subscriber import get_nats_subscriber
+            from src.communication.nats_client import get_nats_client
+
+            subscriber = get_nats_subscriber()
+            await subscriber.stop()
+
+            client = get_nats_client()
+            await client.close()
+
+            logger.info("NATS subscriber and connection shut down.")
+        except Exception as e:
+            logger.warning("Error during NATS shutdown: %s", e)
 
 
 # ── Direct execution ───────────────────────────────────────────

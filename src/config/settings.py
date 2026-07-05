@@ -98,7 +98,18 @@ class Settings(BaseSettings):
     # Minimum LLM confidence to auto-approve without human review
     validation_confidence_threshold: float = 0.85
 
+    # ── NATS Messaging ──────────────────────────────────────────
+    nats_url: str = "nats://localhost:4222"
+    nats_subject: str = "pov4.alerts.optimization"
+    nats_queue_group: str = "pov3-workers"
+    nats_enabled: bool = False
+
     # ── Derived properties ──────────────────────────────────────
+
+    @property
+    def nats_configured(self) -> bool:
+        """Check if NATS messaging is enabled and URL is provided."""
+        return bool(self.nats_enabled and self.nats_url)
 
     @property
     def snowflake_configured(self) -> bool:

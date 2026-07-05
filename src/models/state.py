@@ -44,6 +44,12 @@ class QueryOptimizationState(TypedDict):
     # Written by ValidationAgent; consumed by HTMLReportGenerator (Section 6).
     validation_evidence: dict[str, Any]
 
+    # ── Retry & Feedback Loop ───────────────────────────────────
+    # Number of times validation has rejected the query and routed back to optimization
+    retry_count: int
+    # Accumulated feedback messages from validation failures
+    feedback_history: list[str]
+
     # ── A2A message ledger ──────────────────────────────────────
     # Annotated with a reducer so each node can *append* messages
     # without overwriting previous entries.
