@@ -10,4 +10,4 @@ __pycache__/
 reports/
 
 manager_discussions/
-test/
+tests/

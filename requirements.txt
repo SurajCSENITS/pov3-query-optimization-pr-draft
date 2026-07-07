@@ -17,3 +17,6 @@ botocore>=1.34.0
 
 # ── NATS Messaging (POV4 → POV3 inter-project communication) ──────────────────
 nats-py>=2.9.0
+
+# ── GitHub PR Agent (codebase graph + draft PR creation) ──────────────────────
+PyGithub>=2.3.0

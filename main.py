@@ -165,6 +165,7 @@ def main() -> None:
         "pr": {},
         "rag_results": [],           # Sprint 2
         "validation_evidence": {},   # Sprint 2
+        "graph_location": {},        # PR Agent: codebase graph lookup result
         "messages": [pov4_message.model_dump()],
     }
 

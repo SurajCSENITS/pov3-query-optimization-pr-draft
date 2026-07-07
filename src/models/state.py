@@ -50,6 +50,10 @@ class QueryOptimizationState(TypedDict):
     # Accumulated feedback messages from validation failures
     feedback_history: list[str]
 
+    # ── Codebase Graph (PR Agent) ──────────────────────────────
+    # Result of graph-based SQL location: {file_path, line_start, line_end}
+    graph_location: dict[str, Any]
+
     # ── A2A message ledger ──────────────────────────────────────
     # Annotated with a reducer so each node can *append* messages
     # without overwriting previous entries.

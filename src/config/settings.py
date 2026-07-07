@@ -104,6 +104,15 @@ class Settings(BaseSettings):
     nats_queue_group: str = "pov3-workers"
     nats_enabled: bool = False
 
+    # ── Target Repository (PR Agent) ────────────────────────────
+    # The application repo containing SQL files to patch.
+    # e.g., "SurajCSENITS/demo-tpch-app"
+    target_repo: str = ""
+    # GitHub PAT with `repo` scope on the target repo.
+    target_repo_token: str = ""
+    # Branch to base new PRs on (default: main).
+    target_repo_default_branch: str = "main"
+
     # ── Derived properties ──────────────────────────────────────
 
     @property
@@ -140,6 +149,11 @@ class Settings(BaseSettings):
     def langsmith_configured(self) -> bool:
         """Check if LangSmith observability is configured."""
         return bool(self.langsmith_api_key and self.langsmith_tracing_v2)
+
+    @property
+    def target_repo_configured(self) -> bool:
+        """Check if target repository credentials are provided for real PR creation."""
+        return bool(self.target_repo and self.target_repo_token)
 
 
 @lru_cache()

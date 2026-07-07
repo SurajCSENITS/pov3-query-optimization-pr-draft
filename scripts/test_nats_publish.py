@@ -25,14 +25,14 @@ async def main():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "sender": "POV4AlertAgent",
         "receiver": "AnalysisAgent",
-        "task": "Analyze slow query 01c549ca-0002-2472-000e-044e0001723e",
+        "task": "Analyze slow query 01c587bb-0002-33bc-000e-044e000583a6",
         "payload": {
-            "query_id": "01c549ca-0002-2472-000e-044e0001723e",
+            "query_id": "01c587bb-0002-33bc-000e-044e000583a6",
             "warehouse": "COMPUTE_WH",
-            "credits_used": 0.00034,
-            "execution_time_seconds": 0.507,
-            "issue_type": "NON_SARGABLE_JOIN_CONDITION",
-            "query_text": "SELECT l.L_ORDERKEY, o.O_ORDERSTATUS, l.L_QUANTITY, o.O_TOTALPRICE FROM LINEITEM l, ORDERS o WHERE l.L_QUANTITY > 49 AND o.O_TOTALPRICE > 400000 AND l.L_ORDERKEY = o.O_ORDERKEY + 1"
+            "credits_used": 0.000023,
+            "execution_time_seconds": 0.200,
+            "issue_type": "NON_SARGABLE_PREDICATE",
+            "query_text": "SELECT * FROM MALL_CUSTOMERS WHERE CAST(AGE AS VARCHAR) LIKE '3%' ORDER BY TO_VARCHAR(ANNUAL_INCOME_K) || ' thousand';"
         }
     }
 
