@@ -61,6 +61,15 @@ class Settings(BaseSettings):
     snowflake_schema: str = "PUBLIC"
     snowflake_role: str = "POV3_AGENT_ROLE"
 
+    # ── Benchmark Warehouse (optional) ─────────────────────────
+    # When set, the ValidationAgent executes the optimized query on
+    # this dedicated warehouse instead of snowflake_warehouse.
+    # This warehouse should have AUTO_SUSPEND=60 so it is always
+    # cold (local disk cache cleared) when our query runs, giving
+    # a clean, reproducible BYTES_SCANNED measurement.
+    # Requires OPERATE + USAGE privileges for POV3_AGENT_ROLE.
+    snowflake_benchmark_warehouse: str = ""
+
     # ── FastAPI Server ──────────────────────────────────────────
     api_host: str = "0.0.0.0"
     api_port: int = 8000
@@ -98,11 +107,26 @@ class Settings(BaseSettings):
     # Minimum LLM confidence to auto-approve without human review
     validation_confidence_threshold: float = 0.85
 
-    # ── NATS Messaging ──────────────────────────────────────────
+    # ── NATS Messaging (JetStream) ──────────────────────────────
     nats_url: str = "nats://localhost:4222"
     nats_subject: str = "pov4.alerts.optimization"
     nats_queue_group: str = "pov3-workers"
     nats_enabled: bool = False
+
+    # JetStream-specific settings
+    # Name of the durable JetStream stream that captures POV4 alerts.
+    # The stream persists messages so they survive POV3 restarts.
+    nats_stream_name: str = "pov4-alerts"
+
+    # Durable consumer name used by the push subscriber.
+    # NATS remembers the last delivered sequence per consumer, enabling
+    # reliable replay after a POV3 crash or restart.
+    nats_consumer_name: str = "pov3-workers-durable"
+
+    # Seconds before an unacknowledged message is redelivered to another
+    # consumer in the queue group (or the same one if it recovers).
+    # Set this higher than the worst-case pipeline execution time.
+    nats_ack_wait_seconds: int = 30
 
     # ── Target Repository (PR Agent) ────────────────────────────
     # The application repo containing SQL files to patch.
@@ -117,7 +141,7 @@ class Settings(BaseSettings):
 
     @property
     def nats_configured(self) -> bool:
-        """Check if NATS messaging is enabled and URL is provided."""
+        """Check if NATS JetStream messaging is enabled and URL is provided."""
         return bool(self.nats_enabled and self.nats_url)
 
     @property
@@ -129,6 +153,11 @@ class Settings(BaseSettings):
             and self.snowflake_password
             and self.snowflake_enabled
         )
+
+    @property
+    def benchmark_warehouse_configured(self) -> bool:
+        """True when a dedicated benchmark warehouse is configured for clean BYTES_SCANNED."""
+        return bool(self.snowflake_benchmark_warehouse and self.snowflake_configured)
 
     @property
     def bedrock_configured(self) -> bool:

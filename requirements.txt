@@ -20,3 +20,4 @@ nats-py>=2.9.0
 
 # ── GitHub PR Agent (codebase graph + draft PR creation) ──────────────────────
 PyGithub>=2.3.0
+sqlglot>=25.0.0       # AST fingerprinting for O(1) SQL matching in codebase graph

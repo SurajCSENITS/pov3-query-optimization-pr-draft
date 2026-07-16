@@ -51,18 +51,23 @@ class InsightGenerator:
                 "significantly reducing I/O overhead."
             )
 
-        # ── Bytes scanned reduction ──────────────────────────────
+        # ── Bytes scanned reduction (EXPLAIN estimate) ──────────────────────
+        # NOTE: bytes_scanned_before/after come from EXPLAIN's `bytesAssigned` —
+        # a PRE-EXECUTION estimate computed before micro-partition pruning.
+        # These are NOT actual runtime BYTES_SCANNED. Label them clearly as estimates
+        # to avoid confusion with the real telemetry shown in Performance Metrics.
         if m.bytes_scanned_reduction_pct > 5:
             before_mb = round(m.bytes_scanned_before / 1e6, 2)
             after_mb = round(m.bytes_scanned_after / 1e6, 2)
             if before_mb > 0:
                 insights.append(
-                    f"Bytes scanned reduced from {before_mb} MB to {after_mb} MB "
-                    f"({m.bytes_scanned_reduction_pct:.0f}% reduction in data read)."
+                    f"EXPLAIN estimate: bytes assigned reduced from {before_mb} MB to "
+                    f"{after_mb} MB ({m.bytes_scanned_reduction_pct:.0f}% reduction in "
+                    f"pre-pruning scan scope). Actual runtime bytes may differ."
                 )
             else:
                 insights.append(
-                    f"Estimated bytes scanned reduced by "
+                    f"EXPLAIN estimate: pre-pruning scan scope reduced by "
                     f"{m.bytes_scanned_reduction_pct:.0f}%."
                 )
 

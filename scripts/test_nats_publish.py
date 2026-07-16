@@ -25,14 +25,15 @@ async def main():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "sender": "POV4AlertAgent",
         "receiver": "AnalysisAgent",
-        "task": "Analyze slow query 01c587bb-0002-33bc-000e-044e000583a6",
+        "task": "Analyze slow query 01c5a808-0002-3a35-000e-044e0008348e",
         "payload": {
-            "query_id": "01c587bb-0002-33bc-000e-044e000583a6",
+            "query_id": "01c5a808-0002-3a35-000e-044e0008348e",
             "warehouse": "COMPUTE_WH",
-            "credits_used": 0.000023,
-            "execution_time_seconds": 0.200,
+            "credits_used": 0.00002,
+            "execution_time_seconds": 1.859,
+            "bytes_scanned": 147609264,
             "issue_type": "NON_SARGABLE_PREDICATE",
-            "query_text": "SELECT * FROM MALL_CUSTOMERS WHERE CAST(AGE AS VARCHAR) LIKE '3%' ORDER BY TO_VARCHAR(ANNUAL_INCOME_K) || ' thousand';"
+            "query_text": "SELECT L_ORDERKEY, L_QUANTITY, L_EXTENDEDPRICE FROM LINEITEM WHERE YEAR(L_SHIPDATE) = 1995 AND MONTH(L_SHIPDATE) = 3;"
         }
     }
 

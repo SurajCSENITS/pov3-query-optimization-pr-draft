@@ -373,13 +373,8 @@ class ValidationAgent(BaseAgent):
                 
             # Read existing feedback and append
             history = state.get("feedback_history", [])
-            
-            # Using _merge_lists semantics, but we will just pass a single element list
-            # Wait, TypedDict with Annotated[list, operator.add] or similar?
-            # State definition didn't annotate feedback_history with a reducer!
-            # So we must manually build the full new list.
             new_history = history + [feedback]
-            
+
             extra_state["retry_count"] = current_retry + 1
             extra_state["feedback_history"] = new_history
 
@@ -393,112 +388,211 @@ class ValidationAgent(BaseAgent):
             "extra_state": extra_state,
         }
 
-    # ── Live Snowflake execution ────────────────────────────────────────────
+    # ── Live Snowflake execution ──────────────────────────────────────────────────────
 
     def _execute_optimized_query(
         self,
         optimized_sql: str,
     ) -> tuple[float | None, float | None, int | None, int | None, int | None]:
         """
-        Execute the optimized SQL inside a transaction that is always
-        rolled back so no data is modified (DML/DDL safety).
+        Execute the optimized SQL on Snowflake and return real telemetry.
+
+        When SNOWFLAKE_BENCHMARK_WAREHOUSE is configured the query runs on a
+        dedicated warehouse that is explicitly suspended before execution so its
+        local SSD disk cache is cleared.  This gives a clean, reproducible
+        BYTES_SCANNED measurement (equivalent to running on a fresh cold warehouse),
+        without touching the shared production warehouse.
+
+        The query is always wrapped in BEGIN / ROLLBACK for DML safety.
 
         Returns:
-            (execution_time_sec, credits_used, bytes_scanned, partitions_scanned, partitions_total) on success, or
-            (None, None, None, None, None) on any connection / execution failure.
+            (execution_time_sec, credits_used, bytes_scanned,
+             partitions_scanned, partitions_total) or (None,…) on failure.
         """
         from src.connectors.snowflake_manager import get_connection_manager
 
         try:
             manager = get_connection_manager()
 
-            # Determine actual warehouse size from Snowflake
-            warehouse_name = self._settings.snowflake_warehouse
+            # ── Choose execution warehouse ────────────────────────────────────
+            # Use the benchmark warehouse when configured; fall back to the
+            # production warehouse for backwards compatibility.
+            use_bench   = self._settings.benchmark_warehouse_configured
+            bench_wh    = self._settings.snowflake_benchmark_warehouse
+            prod_wh     = self._settings.snowflake_warehouse
+            exec_wh     = bench_wh if use_bench else prod_wh
+
+            # ── Fetch warehouse size for credit calculation ───────────────────
             warehouse_size = "X-SMALL"
             try:
-                wh_results = manager.execute_query(f"SHOW WAREHOUSES LIKE '{warehouse_name}'")
+                wh_results = manager.execute_query(f"SHOW WAREHOUSES LIKE '{exec_wh}'")
                 if wh_results:
                     row = wh_results[0]
                     warehouse_size = str(row.get("SIZE", row.get("size", "X-SMALL"))).upper()
             except Exception as e:
-                logger.warning("Failed to fetch warehouse size, defaulting to X-SMALL: %s", e)
+                logger.warning("Failed to fetch warehouse size for %s, defaulting to X-SMALL: %s", exec_wh, e)
 
             credits_per_hour = _WAREHOUSE_CREDITS_PER_HOUR.get(warehouse_size, 1.0)
             if warehouse_size not in _WAREHOUSE_CREDITS_PER_HOUR:
                 logger.warning(
-                    "Unknown warehouse size '%s'; defaulting to X-SMALL (1 credit/hour).",
-                    warehouse_size,
+                    "Unknown warehouse size '%s' for %s; defaulting to X-SMALL (1 credit/hour).",
+                    warehouse_size, exec_wh,
                 )
 
-            # Open an explicit transaction — the ROLLBACK guarantees no
-            # persistent writes even if the query performs DML.
+            # ── Benchmark warehouse: suspend → resume cold ────────────────────
+            # Suspending clears the local SSD disk cache so BYTES_SCANNED
+            # reflects only reads from remote storage — no warm-cache inflation.
+            if use_bench:
+                console.print(
+                    f"\n  🧊 [bold cyan]Benchmark warehouse[/] [white]{bench_wh}[/] — "
+                    "suspending to clear local disk cache..."
+                )
+                try:
+                    manager.execute_query(f"ALTER WAREHOUSE {bench_wh} SUSPEND")
+                    time.sleep(2)  # Allow suspension to complete fully
+                    logger.info("Benchmark warehouse %s suspended (cache cleared).", bench_wh)
+                except Exception as e:
+                    # Warehouse may already be suspended — perfectly fine
+                    logger.info(
+                        "Benchmark warehouse %s suspend skipped (already suspended?): %s",
+                        bench_wh, e,
+                    )
+                manager.execute_query(f"ALTER WAREHOUSE {bench_wh} RESUME")
+                manager.execute_query(f"USE WAREHOUSE {bench_wh}")
+                console.print(
+                    f"  ❄️  [bold cyan]{bench_wh}[/] resumed cold — "
+                    "executing optimized query on clean cache..."
+                )
+                logger.info("Session switched to benchmark warehouse %s (cold).", bench_wh)
+            else:
+                console.print(
+                    f"  ⚠️  [yellow]No benchmark warehouse configured — running on "
+                    f"{prod_wh} (warm, BYTES_SCANNED may be inflated).[/]\n"
+                    f"     Set SNOWFLAKE_BENCHMARK_WAREHOUSE in .env for clean measurements."
+                )
+
+            # ── Execute optimized query inside a rolled-back transaction ──────
             manager.execute_query("ALTER SESSION SET USE_CACHED_RESULT = FALSE")
             manager.execute_query("BEGIN")
 
-            start = time.perf_counter()
-            sfqid = None
+            start  = time.perf_counter()
+            sfqid  = None
             try:
                 _, sfqid = manager.execute_query(
                     optimized_sql, fetch_results=False, return_sfqid=True
                 )
+                # Log prominently so the ID can be used for manual Snowflake verification
+                logger.info("Optimized query Snowflake Query ID: %s", sfqid)
+                console.print(
+                    f"\n  🔑 [bold yellow]Optimized Query ID (Snowflake):[/] "
+                    f"[bold white]{sfqid}[/]\n"
+                    f"     Verify: SELECT BYTES_SCANNED FROM TABLE(\n"
+                    f"               INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION())\n"
+                    f"             WHERE QUERY_ID = '{sfqid}';"
+                )
             finally:
-                # Always roll back — even if the query raised an exception.
+                # Always roll back — no persistent side-effects from DML
                 elapsed_wall = time.perf_counter() - start
                 manager.execute_query("ROLLBACK")
                 try:
                     manager.execute_query("ALTER SESSION SET USE_CACHED_RESULT = TRUE")
                 except Exception:
                     pass
+                # Switch session back to the production warehouse regardless of outcome
+                if use_bench:
+                    try:
+                        manager.execute_query(f"USE WAREHOUSE {prod_wh}")
+                        logger.info("Session switched back to production warehouse %s.", prod_wh)
+                    except Exception as e:
+                        logger.warning("Failed to switch back to %s: %s", prod_wh, e)
 
-            # ── Retrieve Exact Telemetry from Session History ───────────────
-            compute_time_sec = elapsed_wall  # Fallback
-            credits_used = (elapsed_wall / 3600.0) * credits_per_hour
-            real_bytes = None
+            # ── Retrieve exact telemetry from INFORMATION_SCHEMA ──────────────
+            compute_time_sec = elapsed_wall  # wall-clock fallback
+            credits_used     = (elapsed_wall / 3600.0) * credits_per_hour
+            real_bytes        = None
             real_parts_scanned = None
-            real_parts_total = None
+            real_parts_total   = None
 
             if sfqid:
                 try:
-                    for _ in range(6):  # Retry up to 3 seconds for metadata to flush
+                    # ── Initial sleep before first poll ───────────────────────
+                    # INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION() requires a
+                    # brief metadata flush delay after query completion.
+                    # Polling immediately returns an empty set — the 2s sleep
+                    # covers the typical flush latency.
+                    logger.debug(
+                        "Waiting 2s for QUERY_HISTORY_BY_SESSION metadata flush "
+                        "(sfqid=%s)...", sfqid
+                    )
+                    time.sleep(2.0)
+
+                    for attempt_num in range(10):  # 10 × 1.5s = up to 15s total
                         history = manager.execute_query(
                             f"""
-                            SELECT EXECUTION_TIME, BYTES_SCANNED
-                            FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION())
+                            SELECT *
+                            FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(
+                                END_TIME_RANGE_START=>DATEADD('minutes', -10, CURRENT_TIMESTAMP())
+                            ))
                             WHERE QUERY_ID = '{sfqid}'
                             """
                         )
                         if history:
                             row = history[0]
+                            logger.info("Entire telemetry from QUERY_HISTORY_BY_SESSION for %s: %s", sfqid, row)
                             if row.get("EXECUTION_TIME") is not None:
-                                # EXECUTION_TIME is in milliseconds and represents pure compute
                                 compute_time_sec = row["EXECUTION_TIME"] / 1000.0
                                 credits_used = (compute_time_sec / 3600.0) * credits_per_hour
                             real_bytes = row.get("BYTES_SCANNED")
                             real_parts_scanned = None
-                            real_parts_total = None
-                            
-                            # If BYTES_SCANNED is still None, it might still be flushing metadata, continue waiting
-                            if real_bytes is None:
-                                time.sleep(0.5)
+                            real_parts_total   = None
+
+                            # Retry on None OR 0 — Snowflake returns 0 (not NULL)
+                            # when stats haven't stabilised after a warehouse resume
+                            if real_bytes is None or real_bytes == 0:
+                                logger.debug(
+                                    "BYTES_SCANNED not yet available for %s "
+                                    "(attempt %d/10, value=%s) — retrying in 1.5s...",
+                                    sfqid, attempt_num + 1, real_bytes,
+                                )
+                                time.sleep(1.5)
                                 continue
-                                
+
                             logger.info(
-                                "Exact Snowflake telemetry retrieved for query %s: "
-                                "compute_time=%.3fs vs wall_time=%.3fs",
-                                sfqid, compute_time_sec, elapsed_wall
+                                "Exact telemetry retrieved for query %s on %s: "
+                                "bytes_scanned=%d, compute_time=%.3fs, wall_time=%.3fs",
+                                sfqid, exec_wh, real_bytes, compute_time_sec, elapsed_wall,
                             )
                             break
-                        time.sleep(0.5)
+                        else:
+                            logger.debug(
+                                "QUERY_HISTORY_BY_SESSION: no row yet for %s "
+                                "(attempt %d/10) — retrying in 1.5s...",
+                                sfqid, attempt_num + 1,
+                            )
+                            time.sleep(1.5)
+                    else:
+                        # All 10 attempts exhausted
+                        logger.warning(
+                            "BYTES_SCANNED never stabilised for query %s after 10 attempts "
+                            "(%.0fs total); real_bytes=%s — PerformanceComparisonEngine will "
+                            "fall back to input_data bytes.",
+                            sfqid, 2.0 + 10 * 1.5, real_bytes,
+                        )
+                        if real_bytes == 0:
+                            real_bytes = None  # Treat 0 as unavailable downstream
+
                 except Exception as e:
                     logger.warning("Failed to retrieve query history for %s: %s", sfqid, e)
 
             logger.info(
-                "Optimized query executed (warehouse=%s, rate=%.0f cr/h, "
-                "compute=%.3fs, credits=%.6f).",
-                warehouse_size,
+                "Optimized query done (warehouse=%s [%s], rate=%.0f cr/h, "
+                "compute=%.3fs, credits=%.6f, bytes=%s).",
+                exec_wh,
+                "BENCH-COLD" if use_bench else "PROD-WARM",
                 credits_per_hour,
                 compute_time_sec,
                 credits_used,
+                real_bytes,
             )
             return compute_time_sec, credits_used, real_bytes, real_parts_scanned, real_parts_total
 
@@ -510,7 +604,7 @@ class ValidationAgent(BaseAgent):
             )
             return None, None, None, None, None
 
-    # ── LLM semantic check ────────────────────────────────────────────────────
+    # ── LLM semantic check ──────────────────────────────────────────────────
 
     def _llm_semantic_check(
         self, original_sql: str, optimized_sql: str

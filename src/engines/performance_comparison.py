@@ -126,35 +126,79 @@ class PerformanceComparisonEngine:
                 "reporting original values (no fabricated improvement)"
             )
 
-        # ── Bytes scanned: use real EXPLAIN diff if available ─────────────────
-        try:
-            diff_metrics = explain_diff.metrics
-            bytes_before  = diff_metrics.bytes_scanned_before
-            bytes_after   = diff_metrics.bytes_scanned_after
-            bytes_pct     = diff_metrics.bytes_scanned_reduction_pct
-        except AttributeError:
-            # explain_diff may be a plain dict in fallback paths
-            metrics = explain_diff.get("metrics", {}) if isinstance(explain_diff, dict) else {}
-            bytes_before = metrics.get("bytes_scanned_before", 0)
-            bytes_after  = metrics.get("bytes_scanned_after", 0)
-            bytes_pct    = metrics.get("bytes_scanned_reduction_pct", 0.0)
+        # ── Bytes scanned ─────────────────────────────────────────────────────
+        #
+        # EXPLAIN USING TEXT embeds `bytesAssigned` — a static PRE-EXECUTION estimate
+        # of bytes allocated to each scan node, computed BEFORE micro-partition pruning.
+        # For a well-pruned query this can be 3–4× larger than the actual bytes read.
+        # It must NEVER be used as the primary source of truth for bytes scanned.
+        #
+        # Priority:
+        #   bytes_before → real_original_bytes_scanned > input_data["BYTES_SCANNED"]
+        #                   > EXPLAIN bytesAssigned (last resort, logged as WARNING)
+        #   bytes_after  → real_optimized_bytes_scanned
+        #                   > EXPLAIN bytesAssigned (last resort, logged as WARNING)
 
-        # Only override EXPLAIN-derived values if Snowflake returned a non-zero byte count.
-        # A value of 0 from QUERY_HISTORY_BY_SESSION typically means the result was served
-        # from cache or metadata — it is NOT a real scan measurement and must be ignored.
+        # Read EXPLAIN estimates — used as a last-resort fallback only
+        try:
+            diff_metrics      = explain_diff.metrics
+            explain_bytes_before = diff_metrics.bytes_scanned_before
+            explain_bytes_after  = diff_metrics.bytes_scanned_after
+            explain_bytes_pct    = diff_metrics.bytes_scanned_reduction_pct
+        except AttributeError:
+            _em = explain_diff.get("metrics", {}) if isinstance(explain_diff, dict) else {}
+            explain_bytes_before = _em.get("bytes_scanned_before", 0)
+            explain_bytes_after  = _em.get("bytes_scanned_after", 0)
+            explain_bytes_pct    = _em.get("bytes_scanned_reduction_pct", 0.0)
+
+        # ── bytes_before: real runtime data always wins over EXPLAIN estimate ─
+        bytes_before = 0
+        if real_original_bytes_scanned is not None and real_original_bytes_scanned > 0:
+            bytes_before = int(real_original_bytes_scanned)
+            logger.info(
+                "PerformanceComparisonEngine: bytes_before = %d "
+                "(source: real_original_bytes_scanned)", bytes_before
+            )
+        else:
+            # POV4 alert payload carries the original query's actual BYTES_SCANNED
+            # from ACCOUNT_USAGE — use it before falling back to EXPLAIN estimates.
+            original_bytes = input_data.get("BYTES_SCANNED", input_data.get("bytes_scanned", 0))
+            if original_bytes:
+                bytes_before = int(original_bytes)
+                logger.info(
+                    "PerformanceComparisonEngine: bytes_before = %d "
+                    "(source: input_data BYTES_SCANNED)", bytes_before
+                )
+            elif explain_bytes_before > 0:
+                bytes_before = explain_bytes_before
+                logger.warning(
+                    "PerformanceComparisonEngine: bytes_before = %d "
+                    "(source: EXPLAIN bytesAssigned — pre-pruning estimate, not actual scan bytes)",
+                    bytes_before,
+                )
+
+        # ── bytes_after: real QUERY_HISTORY telemetry; EXPLAIN is a last resort ─
+        bytes_after = 0
+        bytes_pct   = 0.0
         if real_optimized_bytes_scanned is not None and real_optimized_bytes_scanned > 0:
             bytes_after = real_optimized_bytes_scanned
-            
-            # Use real_original_bytes_scanned if available, else fallback to input_data
-            if real_original_bytes_scanned is not None and real_original_bytes_scanned > 0:
-                bytes_before = int(real_original_bytes_scanned)
-            else:
-                original_bytes = input_data.get("BYTES_SCANNED", input_data.get("bytes_scanned", 0))
-                if original_bytes:
-                    bytes_before = int(original_bytes)
-                    
-            if bytes_before > 0:
-                bytes_pct = (bytes_before - bytes_after) / bytes_before * 100.0
+            logger.info(
+                "PerformanceComparisonEngine: bytes_after = %d "
+                "(source: real_optimized_bytes_scanned from INFORMATION_SCHEMA)", bytes_after
+            )
+        elif explain_bytes_after > 0:
+            bytes_after = explain_bytes_after
+            logger.warning(
+                "PerformanceComparisonEngine: bytes_after = %d "
+                "(source: EXPLAIN bytesAssigned — pre-pruning estimate; "
+                "real telemetry unavailable. Result may be inflated.)",
+                bytes_after,
+            )
+            bytes_pct = explain_bytes_pct
+
+        # Recompute reduction pct from the final before/after values
+        if bytes_before > 0 and bytes_after > 0:
+            bytes_pct = (bytes_before - bytes_after) / bytes_before * 100.0
 
         if bytes_before > 0:
             bytes_before_mb = round(bytes_before / 1e6, 2)
@@ -166,7 +210,7 @@ class PerformanceComparisonEngine:
             bytes_after_mb  = 0.0
             bytes_pct       = 0.0
             logger.info(
-                "PerformanceComparisonEngine: no EXPLAIN bytes data — "
+                "PerformanceComparisonEngine: no bytes data available — "
                 "reporting 0.0 (no fabricated bytes)"
             )
 

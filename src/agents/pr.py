@@ -64,7 +64,9 @@ class PRAgent(BaseAgent):
         github_pr_result = None
         graph_location_data = {}
 
-        if self._settings.target_repo_configured:
+        if decision == "REJECTED":
+            console.print("  ❌ [red]PR creation skipped because the optimization was rejected.[/]")
+        elif self._settings.target_repo_configured:
             github_pr_result, graph_location_data = self._create_real_pr(
                 report=report,
                 branch_name=branch_name,
@@ -75,6 +77,7 @@ class PRAgent(BaseAgent):
             )
 
         # ── Build output dict ───────────────────────────────────
+        pr_status = "SKIPPED" if decision == "REJECTED" else ("DRAFT_PR_CREATED" if github_pr_result else "SIMULATED")
         pr_output = {
             "query_id": report["query_id"],
             "branch_name": branch_name,
@@ -84,7 +87,7 @@ class PRAgent(BaseAgent):
             "validation_decision": decision,
             "labels": labels,
             "auto_merge": False,
-            "status": "DRAFT_PR_CREATED" if github_pr_result else "SIMULATED",
+            "status": pr_status,
         }
 
         if github_pr_result:
@@ -98,6 +101,9 @@ class PRAgent(BaseAgent):
             console.print(
                 f"  🔗 [bold green]Real Draft PR created:[/] [cyan]{github_pr_result.pr_url}[/]"
             )
+        elif decision == "REJECTED":
+            # Rejection message was already printed above
+            pass
         else:
             if self._settings.target_repo_configured:
                 console.print(

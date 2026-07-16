@@ -33,7 +33,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class DiffMetrics:
-    """Quantitative before/after metrics extracted from EXPLAIN output."""
+    """Quantitative before/after metrics extracted from EXPLAIN output.
+
+    IMPORTANT — bytes_scanned_before / bytes_scanned_after:
+        These values come from `bytesAssigned` in `EXPLAIN USING TEXT`, which is a
+        PRE-EXECUTION estimate of bytes allocated to each scan node, calculated BEFORE
+        micro-partition pruning takes effect.  For well-pruned queries they can be
+        3–4× larger than the actual bytes read at runtime.
+
+        Do NOT use them as ground-truth BYTES_SCANNED.  Actual runtime bytes come from
+        INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION() and are handled exclusively by
+        PerformanceComparisonEngine.
+    """
+    # EXPLAIN bytesAssigned estimates (pre-pruning, NOT actual runtime scan bytes)
     bytes_scanned_before: int = 0
     bytes_scanned_after: int = 0
     bytes_scanned_reduction_pct: float = 0.0
@@ -232,6 +244,11 @@ class ExplainPlanDiffEngine:
             match = re.search(pattern, text, re.IGNORECASE)
             return int(match.group(1)) if match else 0
 
+        # Extract EXPLAIN bytesAssigned — a pre-pruning estimate of bytes allocated to
+        # each scan node. This is NOT the same as the actual BYTES_SCANNED at runtime.
+        # The real runtime bytes are retrieved by ValidationAgent from
+        # INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION() and override these values
+        # in PerformanceComparisonEngine.
         m.bytes_scanned_before = extract_int(original, "bytesAssigned")
         m.bytes_scanned_after = extract_int(optimized, "bytesAssigned")
 

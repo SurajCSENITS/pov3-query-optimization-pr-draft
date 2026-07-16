@@ -1,15 +1,14 @@
 """
-NATS publisher utility for POV4 → POV3 communication.
+NATS JetStream publisher for POV4 → POV3 communication.
 
-Provides a lightweight publisher that serializes AgentMessage
-to JSON and publishes to the configured NATS subject.
+Provides a publisher that serializes AgentMessage to JSON and publishes
+to a JetStream stream, receiving a PubAck that confirms the message
+has been durably persisted before returning to the caller.
 
-This module serves two purposes:
-  1. Reference implementation for the POV4 team
-  2. Local testing tool for verifying end-to-end NATS flow
-
-Usage (standalone test):
-    python -m src.communication.publisher
+Compared to the previous NATS Core implementation:
+  - nc.publish()  →  js.publish()  (returns PubAck with stream + seq)
+  - Fire-and-forget → guaranteed receipt by the JetStream server
+  - Retry loop preserved for transient publish errors
 
 Usage (programmatic):
     from src.communication.publisher import NATSPublisher
@@ -18,6 +17,9 @@ Usage (programmatic):
     await pub.connect()
     await pub.publish(message)
     await pub.close()
+
+Usage (standalone test):
+    python -m src.communication.publisher
 """
 
 from __future__ import annotations
@@ -34,18 +36,31 @@ logger = logging.getLogger("pov3.nats.publisher")
 
 class NATSPublisher:
     """
-    Publishes AgentMessage payloads to a NATS subject.
+    Publishes AgentMessage payloads to a NATS JetStream stream.
 
-    Handles connection management, serialization, and
-    retry logic for publish failures.
+    Handles connection management, stream bootstrap, serialization, and
+    retry logic for publish failures.  Each successful publish is confirmed
+    by a PubAck containing the stream name and sequence number.
     """
 
     def __init__(self) -> None:
         self._client = get_nats_client()
 
     async def connect(self) -> None:
-        """Connect to NATS server (delegates to shared client)."""
+        """
+        Connect to NATS and ensure the JetStream stream exists.
+
+        Delegates connection to the shared NATSConnectionManager, then
+        calls ensure_stream() so this publisher can be used standalone
+        (e.g. for local testing) without depending on the subscriber
+        startup path.
+        """
+        settings = get_settings()
         await self._client.connect()
+        await self._client.ensure_stream(
+            name=settings.nats_stream_name,
+            subjects=[settings.nats_subject],
+        )
 
     async def publish(
         self,
@@ -53,15 +68,22 @@ class NATSPublisher:
         subject: str | None = None,
     ) -> None:
         """
-        Publish an AgentMessage to the configured NATS subject.
+        Publish an AgentMessage to the JetStream stream.
+
+        The call blocks until the NATS server returns a PubAck, confirming
+        that the message has been durably stored in the stream.  On failure
+        the publish is retried up to 3 times with linear back-off.
 
         Args:
             message: The AgentMessage to publish.
             subject: Override subject (defaults to NATS_SUBJECT from .env).
+
+        Raises:
+            RuntimeError: If all 3 publish attempts fail.
         """
         settings = get_settings()
         target_subject = subject or settings.nats_subject
-        nc = self._client.connection
+        js = self._client.jetstream
 
         payload = message.model_dump_json().encode("utf-8")
 
@@ -69,19 +91,20 @@ class NATSPublisher:
         last_error = None
         for attempt in range(1, 4):
             try:
-                await nc.publish(target_subject, payload)
-                await nc.flush()
+                ack = await js.publish(target_subject, payload)
                 logger.info(
-                    "Published message_id=%s to '%s' (attempt %d)",
+                    "Published message_id=%s to stream='%s' subject='%s' seq=%d (attempt %d)",
                     message.message_id,
+                    ack.stream,
                     target_subject,
+                    ack.seq,
                     attempt,
                 )
                 return
             except Exception as e:
                 last_error = e
                 logger.warning(
-                    "Publish attempt %d failed for message_id=%s: %s",
+                    "JetStream publish attempt %d failed for message_id=%s: %s",
                     attempt,
                     message.message_id,
                     e,
@@ -95,7 +118,7 @@ class NATSPublisher:
         )
 
     async def close(self) -> None:
-        """Close the NATS connection."""
+        """Gracefully close the NATS connection."""
         await self._client.close()
 
 
@@ -106,19 +129,16 @@ async def _main() -> None:
     sample_message = AgentMessage(
         sender=AgentRole.POV4_ALERT.value,
         receiver=AgentRole.ANALYSIS.value,
-        task="Analyze slow query Q-TEST-001 — REMOTE_SPILL",
+        task="Analyze slow query 01c5a808-0002-3a35-000e-044e0008348e",
         payload={
-            "query_id": "Q-TEST-001",
-            "query_text": (
-                "SELECT * FROM ORDERS o "
-                "JOIN CUSTOMER c ON o.o_custkey = c.c_custkey "
-                "WHERE YEAR(o.o_orderdate) = 1995"
-            ),
-            "warehouse": "WH_LARGE",
-            "credits_used": 18,
-            "execution_time_seconds": 240,
-            "issue_type": "REMOTE_SPILL",
-        },
+            "query_id": "01c5a808-0002-3a35-000e-044e0008348e",
+            "warehouse": "COMPUTE_WH",
+            "credits_used": 0.00002,
+            "execution_time_seconds": 1.859,
+            "bytes_scanned": 147609264,
+            "issue_type": "NON_SARGABLE_PREDICATE",
+            "query_text": "SELECT L_ORDERKEY, L_QUANTITY, L_EXTENDEDPRICE FROM LINEITEM WHERE YEAR(L_SHIPDATE) = 1995 AND MONTH(L_SHIPDATE) = 3;"
+        }
     )
 
     publisher = NATSPublisher()
@@ -126,7 +146,7 @@ async def _main() -> None:
         await publisher.connect()
         print(f"📨 Publishing test alert: {sample_message.summary()}")
         await publisher.publish(sample_message)
-        print("✅ Published successfully!")
+        print("✅ Published successfully with JetStream PubAck!")
     finally:
         await publisher.close()
 

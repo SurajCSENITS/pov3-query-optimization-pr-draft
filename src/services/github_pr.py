@@ -170,15 +170,27 @@ class GitHubPRCreator:
 
         Returns the commit SHA.
         """
-        # Get the current file content + SHA from the base branch
+        # Get the current file content + SHA from the target branch.
+        # We MUST read from branch_name (not base_branch) because the branch
+        # may already exist with a different file SHA (e.g. on retry), and
+        # GitHub's Contents API requires the SHA to match the file on the
+        # branch being updated — a mismatch causes a 409 conflict.
         try:
-            contents = self._repo.get_contents(file_path, ref=base_branch)
+            contents = self._repo.get_contents(file_path, ref=branch_name)
         except GithubException as exc:
             if exc.status == 404:
-                raise RuntimeError(
-                    f"File '{file_path}' not found in {self._repo.full_name}@{base_branch}"
-                )
-            raise
+                # Branch is brand-new: fall back to reading from base_branch
+                try:
+                    contents = self._repo.get_contents(file_path, ref=base_branch)
+                except GithubException as base_exc:
+                    if base_exc.status == 404:
+                        raise RuntimeError(
+                            f"File '{file_path}' not found in "
+                            f"{self._repo.full_name}@{base_branch}"
+                        )
+                    raise
+            else:
+                raise
 
         if isinstance(contents, list):
             raise RuntimeError(f"'{file_path}' is a directory, not a file")
