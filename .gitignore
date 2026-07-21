@@ -9,5 +9,4 @@ __pycache__/
 # Sprint 2: auto-generated HTML optimization reports
 reports/
 
-manager_discussions/
 tests/

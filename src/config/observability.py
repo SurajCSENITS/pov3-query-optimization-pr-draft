@@ -3,15 +3,15 @@ import re
 
 def get_langsmith_client():
     """
-    Initialize and return a LangSmith Client configured with a RuleNodeProcessor
-    to automatically mask PII in traces.
+    Initialize and return a LangSmith Client configured with an anonymizer
+    callable function to automatically mask PII in traces.
     """
     if not os.getenv("LANGSMITH_API_KEY"):
         return None
 
     try:
         from langsmith import Client
-        from langsmith.anonymizer import RuleNodeProcessor, StringNodeRule
+        from langsmith.anonymizer import StringNodeRule, create_anonymizer
     except ImportError:
         return None
 
@@ -34,8 +34,8 @@ def get_langsmith_client():
         )
     ]
 
-    # Create the processor with our rules
-    processor = RuleNodeProcessor(rules=rules)
+    # Create anonymizer callable using rules
+    anonymizer = create_anonymizer(replacer=rules)
 
-    # Return a client instance that automatically uses this processor
-    return Client(anonymizer=processor)
+    # Return a client instance that automatically uses this anonymizer
+    return Client(anonymizer=anonymizer)

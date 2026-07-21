@@ -51,11 +51,7 @@ def get_retriever(top_k: int = _DEFAULT_TOP_K) -> Any:
 
     retriever = AmazonKnowledgeBasesRetriever(
         knowledge_base_id=settings.bedrock_kb_id,
-        retrieval_config={
-            "vectorSearchConfiguration": {
-                "numberOfResults": top_k,
-            }
-        },
+        # retrieval_config removed as vectorSearchConfiguration is incompatible with managed KBs
         region_name=settings.aws_region,
         credentials_profile_name=None,
     )

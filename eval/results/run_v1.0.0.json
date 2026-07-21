@@ -1,0 +1,126 @@
+{
+  "meta": {
+    "prompt_version": "v1.0.0",
+    "timestamp": "2026-07-20T15:30:07.591891+00:00",
+    "dataset": "eval/golden_dataset.jsonl",
+    "pass_threshold": 0.6
+  },
+  "summary": {
+    "total_cases": 3,
+    "passed_cases": 3,
+    "failed_cases": 0,
+    "error_cases": 0,
+    "avg_format_score": 1.0,
+    "avg_hallucination_score": 1.0,
+    "avg_semantic_equivalence_score": 0.95,
+    "avg_confidence_score": 0.9333,
+    "avg_bottleneck_coverage_score": 0.6667,
+    "avg_composite_score": 0.9308
+  },
+  "results": [
+    {
+      "id": "01c5a80c-0002-3a35-000e-044e000834f2",
+      "description": "NOT IN with subquery \u2014 poor performance vs NOT EXISTS or anti-join",
+      "tags": [
+        "not_in",
+        "subquery",
+        "anti_join"
+      ],
+      "llm_call_succeeded": true,
+      "error_message": "",
+      "original_sql": "SELECT P_PARTKEY, P_NAME, P_RETAILPRICE FROM PART WHERE P_PARTKEY NOT IN ( SELECT L_PARTKEY FROM LINEITEM WHERE L_RETURNFLAG = 'R' )",
+      "optimized_sql": "SELECT P_PARTKEY, P_NAME, P_RETAILPRICE FROM PART WHERE P_PARTKEY NOT IN (SELECT L_PARTKEY FROM LINEITEM WHERE L_RETURNFLAG = 'R')",
+      "claimed_change_count": 0,
+      "hallucinated_change_count": 0,
+      "verified_changes": [],
+      "semantic_equivalent": true,
+      "semantic_confidence": 1.0,
+      "scores": {
+        "format_score": 1.0,
+        "hallucination_score": 1.0,
+        "semantic_equivalence_score": 1.0,
+        "confidence_score": 1.0,
+        "bottleneck_coverage_score": 0.0,
+        "composite_score": 0.85
+      }
+    },
+    {
+      "id": "01c5a807-0002-3a35-000e-044e0008341a",
+      "description": "DISTINCT on large result set instead of GROUP BY \u2014 implicit cross join syntax",
+      "tags": [
+        "distinct",
+        "implicit_join",
+        "large_result_set"
+      ],
+      "llm_call_succeeded": true,
+      "error_message": "",
+      "original_sql": "SELECT DISTINCT C_NAME, C_NATIONKEY, O_ORDERSTATUS FROM CUSTOMER, ORDERS WHERE CUSTOMER.C_CUSTKEY = ORDERS.O_CUSTKEY",
+      "optimized_sql": "SELECT C_NAME, C_NATIONKEY, O_ORDERSTATUS FROM CUSTOMER JOIN ORDERS ON CUSTOMER.C_CUSTKEY = ORDERS.O_CUSTKEY",
+      "claimed_change_count": 2,
+      "hallucinated_change_count": 0,
+      "verified_changes": [
+        {
+          "type": "REDUNDANT_DISTINCT",
+          "action": "Removed DISTINCT from the SELECT clause",
+          "reason": "The DISTINCT keyword is redundant because the join operation inherently removes duplicates.",
+          "bottleneck_id": "b1"
+        },
+        {
+          "type": "UNFILTERED_JOIN",
+          "action": "Rewrote the join using explicit JOIN syntax",
+          "reason": "Using explicit JOIN syntax improves readability and allows for more control over join conditions.",
+          "bottleneck_id": "b2"
+        }
+      ],
+      "semantic_equivalent": true,
+      "semantic_confidence": 0.9,
+      "scores": {
+        "format_score": 1.0,
+        "hallucination_score": 1.0,
+        "semantic_equivalence_score": 0.9,
+        "confidence_score": 0.9,
+        "bottleneck_coverage_score": 1.0,
+        "composite_score": 0.965
+      }
+    },
+    {
+      "id": "01c5a808-0002-3a35-000e-044e0008348e",
+      "description": "Function on filter column prevents partition pruning \u2014 YEAR/MONTH wrapping date column",
+      "tags": [
+        "function_on_column",
+        "partition_pruning",
+        "date_filter"
+      ],
+      "llm_call_succeeded": true,
+      "error_message": "",
+      "original_sql": "SELECT L_ORDERKEY, L_QUANTITY, L_EXTENDEDPRICE FROM LINEITEM WHERE YEAR(L_SHIPDATE) = 1995 AND MONTH(L_SHIPDATE) = 3",
+      "optimized_sql": "SELECT L_ORDERKEY, L_QUANTITY, L_EXTENDEDPRICE FROM LINEITEM WHERE L_SHIPDATE BETWEEN '1995-03-01' AND '1995-03-31'",
+      "claimed_change_count": 2,
+      "hallucinated_change_count": 0,
+      "verified_changes": [
+        {
+          "type": "NON_SARGABLE_PREDICATE",
+          "action": "Replaced YEAR(L_SHIPDATE) = 1995 AND MONTH(L_SHIPDATE) = 3 with L_SHIPDATE BETWEEN '1995-03-01' AND '1995-03-31'",
+          "reason": "This change makes the predicate sargable, allowing the use of an index if available.",
+          "bottleneck_id": "b1"
+        },
+        {
+          "type": "FULL_TABLE_SCAN",
+          "action": "Applied a sargable predicate to reduce the number of rows scanned.",
+          "reason": "Reducing the number of rows scanned can improve performance by minimizing the amount of data read from disk.",
+          "bottleneck_id": "b2"
+        }
+      ],
+      "semantic_equivalent": true,
+      "semantic_confidence": 0.95,
+      "scores": {
+        "format_score": 1.0,
+        "hallucination_score": 1.0,
+        "semantic_equivalence_score": 0.95,
+        "confidence_score": 0.9,
+        "bottleneck_coverage_score": 1.0,
+        "composite_score": 0.9775
+      }
+    }
+  ]
+}

@@ -18,6 +18,15 @@ from __future__ import annotations
 from langchain_core.prompts import ChatPromptTemplate
 
 
+# ── Prompt versioning ─────────────────────────────────────────────────────────
+# Bump these strings whenever you edit the corresponding system prompt text.
+# The PromptEvaluator and online telemetry both read these values so that
+# benchmark runs and production logs can be correlated to a specific version.
+
+OPTIMIZATION_PROMPT_VERSION = "v1.0.0"
+SCREENER_PROMPT_VERSION = "v1.0.0"
+
+
 # ── System prompt for SQL optimization ───────────────────────────────────────
 
 SYSTEM_PROMPT = """\
